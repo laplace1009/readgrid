@@ -164,6 +164,10 @@ impl App {
             KeyCode::Enter => {
                 self.activate_selected_connection().await?;
             }
+            KeyCode::Esc => {
+                self.status = "Exited ReadGrid and returned to the terminal.".into();
+                return Ok(true);
+            }
             _ => {}
         }
         Ok(false)
@@ -429,6 +433,16 @@ impl App {
         }
     }
 
+    fn controls_hint(&self) -> &'static str {
+        match self.screen {
+            Screen::Connections => "Enter connect | Esc quit | q quit",
+            Screen::Schemas => "Enter open schema | Esc back | q quit",
+            Screen::Browser if self.search_mode => "Type filter | Enter apply | Esc clear",
+            Screen::Browser => "Enter detail | / filter | r reload | Esc back | q quit",
+            Screen::Detail => "[ ] sort | s order | n/p page | r reload | Esc back | q quit",
+        }
+    }
+
     fn render_connections(&self, frame: &mut Frame) {
         let chunks = main_chunks(frame.area());
         let body = Layout::default()
@@ -460,7 +474,8 @@ impl App {
                     Line::from(String::new()),
                     Line::from("Hints:"),
                     Line::from("- Enter: connect"),
-                    Line::from("- q: quit"),
+                    Line::from("- Esc: quit to terminal"),
+                    Line::from("- q: quit to terminal"),
                     Line::from(format!(
                         "- Add saved profiles in {}",
                         self.config.profiles_path.display()
@@ -477,7 +492,7 @@ impl App {
             .wrap(Wrap { trim: false });
         frame.render_widget(panel, body[1]);
 
-        frame.render_widget(status_bar(&self.status), chunks[1]);
+        frame.render_widget(status_bar(&self.status, self.controls_hint()), chunks[1]);
     }
 
     fn render_schemas(&self, frame: &mut Frame) {
@@ -493,7 +508,7 @@ impl App {
             .block(Block::default().title("Schemas").borders(Borders::ALL))
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
         frame.render_stateful_widget(list, chunks[0], &mut state);
-        frame.render_widget(status_bar(&self.status), chunks[1]);
+        frame.render_widget(status_bar(&self.status, self.controls_hint()), chunks[1]);
     }
 
     fn render_browser(&self, frame: &mut Frame) {
@@ -549,12 +564,13 @@ impl App {
             Line::from("- Enter: open detail"),
             Line::from("- r: reload tables"),
             Line::from("- Esc: back"),
+            Line::from("- q: quit to terminal"),
         ];
         let panel = Paragraph::new(summary)
             .block(Block::default().title("Browser").borders(Borders::ALL))
             .wrap(Wrap { trim: false });
         frame.render_widget(panel, body[1]);
-        frame.render_widget(status_bar(&self.status), chunks[1]);
+        frame.render_widget(status_bar(&self.status, self.controls_hint()), chunks[1]);
     }
 
     fn render_detail(&self, frame: &mut Frame) {
@@ -571,7 +587,10 @@ impl App {
         let detail = match &self.detail {
             Some(detail) => detail,
             None => {
-                frame.render_widget(status_bar("No table detail loaded."), chunks[1]);
+                frame.render_widget(
+                    status_bar("No table detail loaded.", self.controls_hint()),
+                    chunks[1],
+                );
                 return;
             }
         };
@@ -646,7 +665,7 @@ impl App {
         };
         let preview_widget = render_preview(preview, &detail.columns, preview_title);
         frame.render_widget(preview_widget, body[2]);
-        frame.render_widget(status_bar(&self.status), chunks[1]);
+        frame.render_widget(status_bar(&self.status, self.controls_hint()), chunks[1]);
     }
 
     fn move_connection(&mut self, delta: isize) {
@@ -805,10 +824,15 @@ fn main_chunks(area: Rect) -> Vec<Rect> {
         .to_vec()
 }
 
-fn status_bar(message: &str) -> Paragraph<'_> {
+fn status_bar(message: impl Into<String>, controls: impl Into<String>) -> Paragraph<'static> {
+    let message = message.into();
+    let controls = controls.into();
+
     Paragraph::new(Line::from(vec![
         Span::styled(" readgrid ", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(message),
+        Span::raw("  "),
+        Span::styled(controls, Style::default().add_modifier(Modifier::DIM)),
     ]))
     .block(Block::default().borders(Borders::TOP))
 }
@@ -862,4 +886,131 @@ fn render_preview<'a>(
     Table::new(rows, widths)
         .header(header)
         .block(Block::default().title(title).borders(Borders::ALL))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyModifiers;
+
+    fn test_app(screen: Screen, search_mode: bool) -> App {
+        App {
+            config: ConfigStore {
+                profiles_path: PathBuf::from("profiles.toml"),
+                state_path: PathBuf::from("state.toml"),
+                file: crate::config::ConfigFile::default(),
+                state: crate::config::StateFile::default(),
+            },
+            screen,
+            candidates: vec![ConnectionCandidate {
+                profile: ConnectionProfile {
+                    name: "sample".into(),
+                    kind: DatabaseKind::Sqlite,
+                    url: None,
+                    path: Some(PathBuf::from("sample.db")),
+                },
+                source: "saved",
+                preferred_schema: None,
+            }],
+            connection_index: 0,
+            schemas: vec!["public".into()],
+            schema_index: 0,
+            tables: vec![TableRef {
+                schema: None,
+                name: "widgets".into(),
+            }],
+            table_index: 0,
+            filter: String::new(),
+            search_mode,
+            session: None,
+            active_profile: None,
+            active_schema: None,
+            detail: None,
+            preview: None,
+            sort_index: 0,
+            sort_desc: false,
+            status: String::new(),
+            example_config: String::new(),
+            pending_auto_connect: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn q_quits_globally_when_not_searching() {
+        let mut app = test_app(Screen::Browser, false);
+
+        let should_quit = app
+            .handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(should_quit);
+    }
+
+    #[tokio::test]
+    async fn esc_quits_from_connections_screen() {
+        let mut app = test_app(Screen::Connections, false);
+
+        let should_quit = app
+            .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(should_quit);
+    }
+
+    #[tokio::test]
+    async fn esc_goes_back_from_schemas_screen() {
+        let mut app = test_app(Screen::Schemas, false);
+
+        let should_quit = app
+            .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(!should_quit);
+        assert_eq!(app.screen, Screen::Connections);
+    }
+
+    #[tokio::test]
+    async fn esc_clears_search_without_quitting() {
+        let mut app = test_app(Screen::Browser, true);
+        app.filter = "wi".into();
+
+        let should_quit = app
+            .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(!should_quit);
+        assert_eq!(app.screen, Screen::Browser);
+        assert!(!app.search_mode);
+        assert!(app.filter.is_empty());
+    }
+
+    #[tokio::test]
+    async fn q_is_search_input_while_filtering() {
+        let mut app = test_app(Screen::Browser, true);
+
+        let should_quit = app
+            .handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(!should_quit);
+        assert_eq!(app.filter, "q");
+    }
+
+    #[tokio::test]
+    async fn esc_returns_to_browser_from_detail() {
+        let mut app = test_app(Screen::Detail, false);
+
+        let should_quit = app
+            .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(!should_quit);
+        assert_eq!(app.screen, Screen::Browser);
+    }
 }
