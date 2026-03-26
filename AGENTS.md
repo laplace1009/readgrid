@@ -22,7 +22,7 @@ For greenfield projects, major features, large refactors, or ambiguous requests,
 If the request is still fuzzy, interview first. Once the spec is approved, create a `/plan` before implementation. Small, well-scoped fixes can skip this workflow when acceptance criteria are already clear.
 
 ## Commit & Pull Request Guidelines
-Create a branch before starting work, and make the name explicit about the change. Use prefixes such as `feat/`, `fix/`, `docs/`, or `chore/`, for example `feat/grid-parser`, `fix/input-validation`, or `docs/contributor-guide`.
+Always create and switch to a dedicated branch before starting any work. This rule applies to every task, including documentation-only updates and small fixes. Do not begin implementation or documentation changes on the default branch. Make the branch name explicit about the change, using prefixes such as `feat/`, `fix/`, `docs/`, or `chore/`, for example `feat/grid-parser`, `fix/input-validation`, or `docs/contributor-guide`.
 
 History currently starts with `Initial commit`, so keep commit subjects short, imperative, and under 72 characters, for example `Add grid parser skeleton`. Separate refactors from behavior changes when practical.
 
