@@ -77,7 +77,7 @@ sqlite3 sample/readgrid_demo.db < sample/readgrid_demo.sql
 - 연결 화면: `Enter` 연결, `Esc` 또는 `q` 종료
 - 테이블 브라우저: `/` 필터, `r` 새로고침, `Enter` 상세 보기
 - 상세 화면: `e` CSV 내보내기, `f` 필터 추가, `[` `]` 정렬 컬럼 이동, `s` 정렬 방향 전환, `n` `p` 페이지 이동, `Enter` 관계 이동, `g` 관계 그래프, `Esc` 뒤로
-- CSV 내보내기는 현재 화면에 보이는 미리보기 페이지 한 장만 저장합니다.
+- CSV 내보내기는 현재 화면에 보이는 미리보기 페이지 한 장만 저장하며, 기본 경로는 `db_csv/` 아래에 제안됩니다.
 
 ### 개발
 
@@ -162,7 +162,7 @@ sqlite3 sample/readgrid_demo.db < sample/readgrid_demo.sql
 - Connections: `Enter` connect, `Esc` or `q` quit
 - Table browser: `/` filter, `r` reload, `Enter` open detail
 - Detail view: `e` export CSV, `f` add filter, `[` `]` move sort column, `s` toggle sort order, `n` `p` change page, `Enter` open relations, `g` relationship graph, `Esc` back
-- CSV export saves only the currently visible preview page in v1.
+- CSV export saves only the currently visible preview page in v1, and the default path is suggested under `db_csv/`.
 
 ### Development
 
