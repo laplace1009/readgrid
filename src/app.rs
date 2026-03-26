@@ -2,21 +2,27 @@ use std::{io::Stdout, path::PathBuf, time::Duration};
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
+    terminal,
+};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table, Wrap},
+    widgets::{
+        Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, Wrap,
+    },
 };
 
 use crate::{
     config::ConfigStore,
     db::{
-        ConnectionProfile, DataPreview, DatabaseKind, ForeignKeyMeta, RelationGraph, RelationNode,
-        RelationNodeRole, Session, SortState, TableDetail, TableRef,
+        ConnectionProfile, DataPreview, DatabaseKind, FilterOperator, ForeignKeyMeta,
+        PreviewFilter, PreviewRequest, RelationGraph, RelationNode, RelationNodeRole, Session,
+        SortState, TableDetail, TableRef,
     },
     mcp::McpContext,
 };
@@ -58,6 +64,28 @@ enum GraphLane {
 }
 
 #[derive(Debug, Clone)]
+enum DetailFilterPrompt {
+    SelectColumn {
+        index: usize,
+    },
+    SelectOperator {
+        column_index: usize,
+        index: usize,
+    },
+    EnterValue {
+        column_index: usize,
+        operator: FilterOperator,
+        value: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailFilterOutcome {
+    None,
+    ReloadPreview,
+}
+
+#[derive(Debug, Clone)]
 struct ConnectionCandidate {
     profile: ConnectionProfile,
     source: &'static str,
@@ -73,13 +101,16 @@ pub struct App {
     schema_index: usize,
     tables: Vec<TableRef>,
     table_index: usize,
-    filter: String,
-    search_mode: bool,
+    table_filter: String,
+    table_search_mode: bool,
     session: Option<Session>,
     active_profile: Option<ConnectionProfile>,
     active_schema: Option<String>,
     detail: Option<TableDetail>,
     detail_view: DetailView,
+    detail_filters: Vec<PreviewFilter>,
+    detail_filter_index: usize,
+    detail_filter_prompt: Option<DetailFilterPrompt>,
     relation_graph: Option<RelationGraph>,
     graph_lane: GraphLane,
     graph_index: usize,
@@ -121,13 +152,16 @@ impl App {
             schema_index: 0,
             tables: Vec::new(),
             table_index: 0,
-            filter: String::new(),
-            search_mode: false,
+            table_filter: String::new(),
+            table_search_mode: false,
             session: None,
             active_profile: None,
             active_schema: None,
             detail: None,
             detail_view: DetailView::Table,
+            detail_filters: Vec::new(),
+            detail_filter_index: 0,
+            detail_filter_prompt: None,
             relation_graph: None,
             graph_lane: GraphLane::Center,
             graph_index: 0,
@@ -168,7 +202,7 @@ impl App {
     }
 
     async fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
-        if matches!(key.code, KeyCode::Char('q')) && !self.search_mode {
+        if matches!(key.code, KeyCode::Char('q')) && !self.is_input_mode_active() {
             return Ok(true);
         }
 
@@ -213,7 +247,7 @@ impl App {
     }
 
     async fn handle_browser_key(&mut self, key: KeyEvent) -> Result<bool> {
-        if self.search_mode {
+        if self.table_search_mode {
             self.handle_search_input(key);
             return Ok(false);
         }
@@ -222,7 +256,7 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.move_table(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_table(1),
             KeyCode::Char('/') => {
-                self.search_mode = true;
+                self.table_search_mode = true;
                 self.status = "Search tables: type to filter, Esc to clear.".into();
             }
             KeyCode::Char('r') => {
@@ -250,6 +284,13 @@ impl App {
             return self.handle_graph_key(key).await;
         }
 
+        if self.detail_filter_prompt.is_some() {
+            if self.handle_detail_filter_prompt_key(key)? == DetailFilterOutcome::ReloadPreview {
+                self.reload_preview().await?;
+            }
+            return Ok(false);
+        }
+
         match key.code {
             KeyCode::Esc => {
                 self.screen = Screen::Browser;
@@ -257,6 +298,19 @@ impl App {
             }
             KeyCode::Char('g') => {
                 self.enter_graph_view().await?;
+            }
+            KeyCode::Char('f') => self.start_detail_filter_prompt(),
+            KeyCode::Char('h') | KeyCode::Left => self.move_detail_filter_selection(-1),
+            KeyCode::Char('l') | KeyCode::Right => self.move_detail_filter_selection(1),
+            KeyCode::Char('x') => {
+                if self.remove_selected_detail_filter() {
+                    self.reload_preview().await?;
+                }
+            }
+            KeyCode::Char('c') => {
+                if self.clear_detail_filters() {
+                    self.reload_preview().await?;
+                }
             }
             KeyCode::Char('[') => {
                 if self.sort_index > 0 {
@@ -283,9 +337,7 @@ impl App {
                     .map(|preview| preview.has_more)
                     .unwrap_or(false)
                 {
-                    if let Some(preview) = &mut self.preview {
-                        preview.page += 1;
-                    }
+                    self.preview_page_forward();
                     self.reload_preview().await?;
                 }
             }
@@ -297,16 +349,13 @@ impl App {
                     .unwrap_or(0)
                     > 0
                 {
-                    if let Some(preview) = &mut self.preview {
-                        preview.page -= 1;
-                    }
+                    self.preview_page_back();
                     self.reload_preview().await?;
                 }
             }
             KeyCode::Char('r') => {
-                if let Some(table) = self.detail.as_ref().map(|detail| detail.table.clone()) {
-                    self.load_table_detail(table, DetailView::Table).await?;
-                }
+                self.reload_preview().await?;
+                self.status = "Reloaded preview data.".into();
             }
             _ => {}
         }
@@ -343,24 +392,245 @@ impl App {
     fn handle_search_input(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
-                self.search_mode = false;
-                self.filter.clear();
+                self.table_search_mode = false;
+                self.table_filter.clear();
                 self.table_index = 0;
                 self.status = "Cleared table filter.".into();
             }
             KeyCode::Enter => {
-                self.search_mode = false;
-                self.status = format!("Filtering tables by '{}'.", self.filter);
+                self.table_search_mode = false;
+                self.status = format!("Filtering tables by '{}'.", self.table_filter);
             }
             KeyCode::Backspace => {
-                self.filter.pop();
+                self.table_filter.pop();
                 self.clamp_table_index();
             }
             KeyCode::Char(ch) => {
-                self.filter.push(ch);
+                self.table_filter.push(ch);
                 self.clamp_table_index();
             }
             _ => {}
+        }
+    }
+
+    fn start_detail_filter_prompt(&mut self) {
+        let Some(detail) = &self.detail else {
+            self.status = "No table detail loaded for filtering.".into();
+            return;
+        };
+        if detail.columns.is_empty() {
+            self.status = "No columns available for filtering.".into();
+            return;
+        }
+
+        self.detail_filter_prompt = Some(DetailFilterPrompt::SelectColumn { index: 0 });
+        self.status = "Choose a column for the new filter.".into();
+    }
+
+    fn handle_detail_filter_prompt_key(&mut self, key: KeyEvent) -> Result<DetailFilterOutcome> {
+        let Some(prompt) = self.detail_filter_prompt.clone() else {
+            return Ok(DetailFilterOutcome::None);
+        };
+        let column_count = self
+            .detail
+            .as_ref()
+            .map(|detail| detail.columns.len())
+            .unwrap_or(0);
+
+        match prompt {
+            DetailFilterPrompt::SelectColumn { index } => match key.code {
+                KeyCode::Esc => {
+                    self.detail_filter_prompt = None;
+                    self.status = "Canceled filter builder.".into();
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.detail_filter_prompt = Some(DetailFilterPrompt::SelectColumn {
+                        index: move_index(index, column_count, -1),
+                    });
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.detail_filter_prompt = Some(DetailFilterPrompt::SelectColumn {
+                        index: move_index(index, column_count, 1),
+                    });
+                }
+                KeyCode::Enter => {
+                    self.detail_filter_prompt = Some(DetailFilterPrompt::SelectOperator {
+                        column_index: index,
+                        index: 0,
+                    });
+                    self.status = "Choose a filter operator.".into();
+                }
+                _ => {}
+            },
+            DetailFilterPrompt::SelectOperator {
+                column_index,
+                index,
+            } => match key.code {
+                KeyCode::Esc => {
+                    self.detail_filter_prompt = Some(DetailFilterPrompt::SelectColumn {
+                        index: column_index,
+                    });
+                    self.status = "Returned to column selection.".into();
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.detail_filter_prompt = Some(DetailFilterPrompt::SelectOperator {
+                        column_index,
+                        index: move_index(index, FilterOperator::ALL.len(), -1),
+                    });
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.detail_filter_prompt = Some(DetailFilterPrompt::SelectOperator {
+                        column_index,
+                        index: move_index(index, FilterOperator::ALL.len(), 1),
+                    });
+                }
+                KeyCode::Enter => {
+                    let operator = FilterOperator::ALL[index];
+                    if operator.requires_value() {
+                        self.detail_filter_prompt = Some(DetailFilterPrompt::EnterValue {
+                            column_index,
+                            operator,
+                            value: String::new(),
+                        });
+                        self.status = "Type a filter value and press Enter.".into();
+                    } else {
+                        self.push_detail_filter(PreviewFilter {
+                            column_name: self.detail_column_name(column_index)?.to_string(),
+                            operator,
+                            value: None,
+                        });
+                        return Ok(DetailFilterOutcome::ReloadPreview);
+                    }
+                }
+                _ => {}
+            },
+            DetailFilterPrompt::EnterValue {
+                column_index,
+                operator,
+                mut value,
+            } => match key.code {
+                KeyCode::Esc => {
+                    self.detail_filter_prompt = Some(DetailFilterPrompt::SelectOperator {
+                        column_index,
+                        index: FilterOperator::ALL
+                            .iter()
+                            .position(|candidate| *candidate == operator)
+                            .unwrap_or(0),
+                    });
+                    self.status = "Returned to operator selection.".into();
+                }
+                KeyCode::Backspace => {
+                    value.pop();
+                    self.detail_filter_prompt = Some(DetailFilterPrompt::EnterValue {
+                        column_index,
+                        operator,
+                        value,
+                    });
+                }
+                KeyCode::Enter => {
+                    if value.is_empty() {
+                        self.detail_filter_prompt = Some(DetailFilterPrompt::EnterValue {
+                            column_index,
+                            operator,
+                            value,
+                        });
+                        self.status =
+                            "Enter a non-empty filter value or press Esc to cancel.".into();
+                    } else {
+                        self.push_detail_filter(PreviewFilter {
+                            column_name: self.detail_column_name(column_index)?.to_string(),
+                            operator,
+                            value: Some(value),
+                        });
+                        return Ok(DetailFilterOutcome::ReloadPreview);
+                    }
+                }
+                KeyCode::Char(ch) => {
+                    value.push(ch);
+                    self.detail_filter_prompt = Some(DetailFilterPrompt::EnterValue {
+                        column_index,
+                        operator,
+                        value,
+                    });
+                }
+                _ => {
+                    self.detail_filter_prompt = Some(DetailFilterPrompt::EnterValue {
+                        column_index,
+                        operator,
+                        value,
+                    });
+                }
+            },
+        }
+
+        Ok(DetailFilterOutcome::None)
+    }
+
+    fn detail_column_name(&self, column_index: usize) -> Result<&str> {
+        self.detail
+            .as_ref()
+            .and_then(|detail| detail.columns.get(column_index))
+            .map(|column| column.name.as_str())
+            .ok_or_else(|| anyhow!("filter column index out of range"))
+    }
+
+    fn push_detail_filter(&mut self, filter: PreviewFilter) {
+        self.detail_filters.push(filter.clone());
+        self.detail_filter_index = self.detail_filters.len().saturating_sub(1);
+        self.detail_filter_prompt = None;
+        self.reset_preview_page();
+        self.status = format!("Applied filter: {}.", filter.summary());
+    }
+
+    fn move_detail_filter_selection(&mut self, delta: isize) {
+        self.detail_filter_index =
+            move_index(self.detail_filter_index, self.detail_filters.len(), delta);
+    }
+
+    fn remove_selected_detail_filter(&mut self) -> bool {
+        if self.detail_filters.is_empty() {
+            self.status = "No active filters to remove.".into();
+            return false;
+        }
+
+        let removed = self.detail_filters.remove(self.detail_filter_index);
+        if self.detail_filter_index >= self.detail_filters.len() {
+            self.detail_filter_index = self.detail_filters.len().saturating_sub(1);
+        }
+        self.reset_preview_page();
+        self.status = format!("Removed filter: {}.", removed.summary());
+        true
+    }
+
+    fn clear_detail_filters(&mut self) -> bool {
+        if self.detail_filters.is_empty() {
+            self.status = "No active filters to clear.".into();
+            return false;
+        }
+
+        self.detail_filters.clear();
+        self.detail_filter_index = 0;
+        self.detail_filter_prompt = None;
+        self.reset_preview_page();
+        self.status = "Cleared all preview filters.".into();
+        true
+    }
+
+    fn preview_page_forward(&mut self) {
+        if let Some(preview) = &mut self.preview {
+            preview.page += 1;
+        }
+    }
+
+    fn preview_page_back(&mut self) {
+        if let Some(preview) = &mut self.preview {
+            preview.page = preview.page.saturating_sub(1);
+        }
+    }
+
+    fn reset_preview_page(&mut self) {
+        if let Some(preview) = &mut self.preview {
+            preview.page = 0;
         }
     }
 
@@ -377,6 +647,9 @@ impl App {
         self.session = Some(session);
         self.detail = None;
         self.detail_view = DetailView::Table;
+        self.detail_filters.clear();
+        self.detail_filter_index = 0;
+        self.detail_filter_prompt = None;
         self.relation_graph = None;
         self.graph_lane = GraphLane::Center;
         self.graph_index = 0;
@@ -425,10 +698,13 @@ impl App {
             .list_tables(schema.as_deref())
             .await?;
         self.table_index = 0;
-        self.filter.clear();
-        self.search_mode = false;
+        self.table_filter.clear();
+        self.table_search_mode = false;
         self.detail = None;
         self.detail_view = DetailView::Table;
+        self.detail_filters.clear();
+        self.detail_filter_index = 0;
+        self.detail_filter_prompt = None;
         self.relation_graph = None;
         self.graph_lane = GraphLane::Center;
         self.graph_index = 0;
@@ -456,6 +732,9 @@ impl App {
         self.sort_desc = false;
         self.detail = Some(detail);
         self.detail_view = detail_view;
+        self.detail_filters.clear();
+        self.detail_filter_index = 0;
+        self.detail_filter_prompt = None;
         self.graph_lane = GraphLane::Center;
         self.graph_index = 0;
         self.graph_center_scroll = 0;
@@ -481,15 +760,10 @@ impl App {
             .as_ref()
             .map(|detail| detail.table.clone())
             .ok_or_else(|| anyhow!("no table detail is loaded"))?;
-        let page = self
-            .preview
-            .as_ref()
-            .map(|preview| preview.page)
-            .unwrap_or(0);
         let preview = self
             .session()
             .unwrap()
-            .load_preview(&table, self.current_sort().as_ref(), page)
+            .load_preview(&table, &self.current_preview_request())
             .await?;
         self.preview = Some(preview);
         Ok(())
@@ -531,6 +805,22 @@ impl App {
         })
     }
 
+    fn current_preview_request(&self) -> PreviewRequest {
+        PreviewRequest {
+            sort: self.current_sort(),
+            filters: self.detail_filters.clone(),
+            page: self
+                .preview
+                .as_ref()
+                .map(|preview| preview.page)
+                .unwrap_or(0),
+        }
+    }
+
+    fn is_input_mode_active(&self) -> bool {
+        self.table_search_mode || self.detail_filter_prompt.is_some()
+    }
+
     fn render(&self, frame: &mut Frame) {
         match self.screen {
             Screen::Connections => self.render_connections(frame),
@@ -544,13 +834,24 @@ impl App {
         match self.screen {
             Screen::Connections => "Enter connect | Esc quit | q quit",
             Screen::Schemas => "Enter open schema | Esc back | q quit",
-            Screen::Browser if self.search_mode => "Type filter | Enter apply | Esc clear",
+            Screen::Browser if self.table_search_mode => "Type filter | Enter apply | Esc clear",
             Screen::Browser => "Enter detail | / filter | r reload | Esc back | q quit",
             Screen::Detail if self.detail_view == DetailView::Graph => {
                 "Left/Right lane | Up/Down move-or-scroll | Enter center neighbor | g/Esc detail | r reload | q quit"
             }
+            Screen::Detail
+                if matches!(
+                    self.detail_filter_prompt,
+                    Some(DetailFilterPrompt::EnterValue { .. })
+                ) =>
+            {
+                "Type value | Enter apply | Esc cancel"
+            }
+            Screen::Detail if self.detail_filter_prompt.is_some() => {
+                "Up/Down move | Enter confirm | Esc cancel"
+            }
             Screen::Detail => {
-                "g graph | [ ] sort | s order | n/p page | r reload | Esc back | q quit"
+                "f add filter | h/l pick filter | x remove | c clear | [ ] sort | s order | n/p page | g graph | Esc back | q quit"
             }
         }
     }
@@ -636,12 +937,12 @@ impl App {
             .collect::<Vec<_>>();
         let mut state = ListState::default();
         state.select(Some(self.table_index.min(filtered.len().saturating_sub(1))));
-        let title = if self.search_mode {
-            format!("Tables (search: {})", self.filter)
-        } else if self.filter.is_empty() {
+        let title = if self.table_search_mode {
+            format!("Tables (search: {})", self.table_filter)
+        } else if self.table_filter.is_empty() {
             "Tables".into()
         } else {
-            format!("Tables (filtered: {})", self.filter)
+            format!("Tables (filtered: {})", self.table_filter)
         };
         let list = List::new(items)
             .block(Block::default().title(title).borders(Borders::ALL))
@@ -742,6 +1043,11 @@ impl App {
         );
         frame.render_widget(columns, body[0]);
 
+        let metadata_sections = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+            .split(body[1]);
+
         let relationship_text = format_relationships(&detail.foreign_keys);
         let index_text = detail
             .indexes
@@ -769,21 +1075,103 @@ impl App {
                 .borders(Borders::ALL),
         )
         .wrap(Wrap { trim: false });
-        frame.render_widget(metadata, body[1]);
+        frame.render_widget(metadata, metadata_sections[0]);
+
+        let filters = Paragraph::new(detail_filter_lines(
+            &self.detail_filters,
+            self.detail_filter_index,
+        ))
+        .block(
+            Block::default()
+                .title("Active Filters")
+                .borders(Borders::ALL),
+        )
+        .wrap(Wrap { trim: false });
+        frame.render_widget(filters, metadata_sections[1]);
 
         let preview = self.preview.as_ref();
-        let preview_title = match self.current_sort() {
-            Some(sort) => format!(
-                "Preview page {} sorted by {} {}",
-                preview.map(|data| data.page + 1).unwrap_or(1),
-                sort.column_name,
-                if sort.descending { "desc" } else { "asc" }
-            ),
-            None => "Preview".into(),
-        };
+        let preview_title = preview_title(
+            preview,
+            self.current_sort().as_ref(),
+            self.detail_filters.len(),
+        );
         let preview_widget = render_preview(preview, &detail.columns, preview_title);
         frame.render_widget(preview_widget, body[2]);
+        if let Some(prompt) = &self.detail_filter_prompt {
+            self.render_detail_filter_prompt(frame, chunks[0], detail, prompt);
+        }
         frame.render_widget(status_bar(&self.status, self.controls_hint()), chunks[1]);
+    }
+
+    fn render_detail_filter_prompt(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        detail: &TableDetail,
+        prompt: &DetailFilterPrompt,
+    ) {
+        let popup = centered_rect(60, 10, area);
+        frame.render_widget(Clear, popup);
+
+        match prompt {
+            DetailFilterPrompt::SelectColumn { index } => {
+                let items = detail
+                    .columns
+                    .iter()
+                    .map(|column| ListItem::new(column.name.clone()))
+                    .collect::<Vec<_>>();
+                let mut state = ListState::default();
+                state.select(Some(*index));
+                let list = List::new(items)
+                    .block(
+                        Block::default()
+                            .title("Add Filter: Column")
+                            .borders(Borders::ALL),
+                    )
+                    .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+                frame.render_stateful_widget(list, popup, &mut state);
+            }
+            DetailFilterPrompt::SelectOperator { index, .. } => {
+                let items = FilterOperator::ALL
+                    .iter()
+                    .map(|operator| ListItem::new(operator.label()))
+                    .collect::<Vec<_>>();
+                let mut state = ListState::default();
+                state.select(Some(*index));
+                let list = List::new(items)
+                    .block(
+                        Block::default()
+                            .title("Add Filter: Operator")
+                            .borders(Borders::ALL),
+                    )
+                    .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+                frame.render_stateful_widget(list, popup, &mut state);
+            }
+            DetailFilterPrompt::EnterValue {
+                column_index,
+                operator,
+                value,
+            } => {
+                let column_name = detail
+                    .columns
+                    .get(*column_index)
+                    .map(|column| column.name.as_str())
+                    .unwrap_or("unknown");
+                let widget = Paragraph::new(vec![
+                    Line::from(format!("Column: {column_name}")),
+                    Line::from(format!("Operator: {}", operator.label())),
+                    Line::from(String::new()),
+                    Line::from(format!("Value: {value}")),
+                ])
+                .block(
+                    Block::default()
+                        .title("Add Filter: Value")
+                        .borders(Borders::ALL),
+                )
+                .wrap(Wrap { trim: false });
+                frame.render_widget(widget, popup);
+            }
+        }
     }
 
     fn move_connection(&mut self, delta: isize) {
@@ -808,11 +1196,11 @@ impl App {
     }
 
     fn filtered_tables(&self) -> Vec<TableRef> {
-        if self.filter.is_empty() {
+        if self.table_filter.is_empty() {
             return self.tables.clone();
         }
 
-        let needle = self.filter.to_lowercase();
+        let needle = self.table_filter.to_lowercase();
         self.tables
             .iter()
             .filter(|table| table.display_name().to_lowercase().contains(&needle))
@@ -868,7 +1256,13 @@ impl App {
                 .as_ref()
                 .map(|detail| detail.columns.len())
                 .unwrap_or(0);
-            self.graph_center_scroll = move_index(self.graph_center_scroll, len, delta);
+            let visible_rows = self.graph_center_visible_rows();
+            let max_scroll = len.saturating_sub(visible_rows);
+            self.graph_center_scroll = move_index(
+                self.graph_center_scroll,
+                max_scroll.saturating_add(1),
+                delta,
+            );
         } else {
             self.graph_index = move_index(
                 self.graph_index,
@@ -915,11 +1309,15 @@ impl App {
             return;
         };
 
+        let visible_rows = graph_center_visible_rows(area);
+        let center_scroll =
+            clamp_graph_center_scroll(self.graph_center_scroll, detail.columns.len(), visible_rows);
+
         if area.width < 100 || area.height < 20 {
             let fallback = Paragraph::new(graph_fallback_lines(
                 graph,
                 detail,
-                self.graph_center_scroll,
+                center_scroll,
                 area.width.saturating_sub(2) as usize,
                 area.height.saturating_sub(2) as usize,
             ))
@@ -954,7 +1352,7 @@ impl App {
         );
         let center = graph_center_lines(
             detail,
-            self.graph_center_scroll,
+            center_scroll,
             lanes[1].width.saturating_sub(2) as usize,
             lanes[1].height.saturating_sub(2) as usize,
         );
@@ -981,7 +1379,7 @@ impl App {
                     Block::default()
                         .title(graph_center_title(
                             detail,
-                            self.graph_center_scroll,
+                            center_scroll,
                             lanes[1].height.saturating_sub(2) as usize,
                         ))
                         .borders(Borders::ALL)
@@ -1013,6 +1411,13 @@ impl App {
 
     fn find_selected_schema_hint(&self) -> Option<String> {
         None
+    }
+
+    fn graph_center_visible_rows(&self) -> usize {
+        terminal::size()
+            .ok()
+            .map(|(width, height)| graph_center_visible_rows(Rect::new(0, 0, width, height)))
+            .unwrap_or(1)
     }
 }
 
@@ -1172,6 +1577,27 @@ fn graph_center_title(detail: &TableDetail, scroll: usize, height: usize) -> Str
         end,
         total
     )
+}
+
+fn graph_center_visible_rows(area: Rect) -> usize {
+    let detail_area = main_chunks(area)[0];
+    if detail_area.width < 100 || detail_area.height < 20 {
+        return detail_area.height.saturating_sub(7).max(1) as usize;
+    }
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(10), Constraint::Length(7)])
+        .split(detail_area);
+    sections[0].height.saturating_sub(2).max(1) as usize
+}
+
+fn clamp_graph_center_scroll(scroll: usize, total_columns: usize, visible_rows: usize) -> usize {
+    if total_columns == 0 {
+        return 0;
+    }
+
+    scroll.min(total_columns.saturating_sub(visible_rows.max(1)))
 }
 
 fn graph_center_border_style(focused: bool) -> Style {
@@ -1373,6 +1799,63 @@ fn main_chunks(area: Rect) -> Vec<Rect> {
         .to_vec()
 }
 
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let popup_width = width.min(area.width.saturating_sub(2).max(1));
+    let popup_height = height.min(area.height.saturating_sub(2).max(1));
+    Rect::new(
+        area.x + area.width.saturating_sub(popup_width) / 2,
+        area.y + area.height.saturating_sub(popup_height) / 2,
+        popup_width,
+        popup_height,
+    )
+}
+
+fn preview_title(
+    preview: Option<&DataPreview>,
+    sort: Option<&SortState>,
+    filter_count: usize,
+) -> String {
+    let page = preview.map(|data| data.page + 1).unwrap_or(1);
+    let filter_label = match filter_count {
+        0 => "no filters".into(),
+        1 => "1 filter".into(),
+        count => format!("{count} filters"),
+    };
+
+    match sort {
+        Some(sort) => format!(
+            "Preview page {} | {} | sorted by {} {}",
+            page,
+            filter_label,
+            sort.column_name,
+            if sort.descending { "desc" } else { "asc" }
+        ),
+        None => format!("Preview page {page} | {filter_label}"),
+    }
+}
+
+fn detail_filter_lines(filters: &[PreviewFilter], selected_index: usize) -> Vec<Line<'static>> {
+    if filters.is_empty() {
+        return vec![
+            Line::from("No active filters."),
+            Line::from("Press f to add one."),
+        ];
+    }
+
+    filters
+        .iter()
+        .enumerate()
+        .map(|(index, filter)| {
+            let text = format!("{}. {}", index + 1, filter.summary());
+            if index == selected_index {
+                Line::styled(text, Style::default().add_modifier(Modifier::REVERSED))
+            } else {
+                Line::from(text)
+            }
+        })
+        .collect()
+}
+
 fn status_bar(message: impl Into<String>, controls: impl Into<String>) -> Paragraph<'static> {
     let message = message.into();
     let controls = controls.into();
@@ -1469,13 +1952,16 @@ mod tests {
                 name: "widgets".into(),
             }],
             table_index: 0,
-            filter: String::new(),
-            search_mode,
+            table_filter: String::new(),
+            table_search_mode: search_mode,
             session: None,
             active_profile: None,
             active_schema: None,
             detail: None,
             detail_view: DetailView::Table,
+            detail_filters: Vec::new(),
+            detail_filter_index: 0,
+            detail_filter_prompt: None,
             relation_graph: None,
             graph_lane: GraphLane::Center,
             graph_index: 0,
@@ -1687,6 +2173,16 @@ mod tests {
         assert!(rendered.contains("owner_id : INTEGER [fk-in] [null]"));
     }
 
+    #[test]
+    fn clamp_graph_center_scroll_resets_when_columns_fit() {
+        assert_eq!(clamp_graph_center_scroll(3, 4, 10), 0);
+    }
+
+    #[test]
+    fn clamp_graph_center_scroll_caps_to_last_full_window() {
+        assert_eq!(clamp_graph_center_scroll(9, 10, 4), 6);
+    }
+
     #[tokio::test]
     async fn q_quits_globally_when_not_searching() {
         let mut app = test_app(Screen::Browser, false);
@@ -1727,7 +2223,7 @@ mod tests {
     #[tokio::test]
     async fn esc_clears_search_without_quitting() {
         let mut app = test_app(Screen::Browser, true);
-        app.filter = "wi".into();
+        app.table_filter = "wi".into();
 
         let should_quit = app
             .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
@@ -1736,8 +2232,8 @@ mod tests {
 
         assert!(!should_quit);
         assert_eq!(app.screen, Screen::Browser);
-        assert!(!app.search_mode);
-        assert!(app.filter.is_empty());
+        assert!(!app.table_search_mode);
+        assert!(app.table_filter.is_empty());
     }
 
     #[tokio::test]
@@ -1750,7 +2246,130 @@ mod tests {
             .unwrap();
 
         assert!(!should_quit);
-        assert_eq!(app.filter, "q");
+        assert_eq!(app.table_filter, "q");
+    }
+
+    #[test]
+    fn start_detail_filter_prompt_begins_with_column_selection() {
+        let mut app = test_app(Screen::Detail, false);
+        app.detail = Some(sample_graph_detail());
+
+        app.start_detail_filter_prompt();
+
+        assert!(matches!(
+            app.detail_filter_prompt,
+            Some(DetailFilterPrompt::SelectColumn { index: 0 })
+        ));
+    }
+
+    #[test]
+    fn value_filter_application_resets_preview_page() {
+        let mut app = test_app(Screen::Detail, false);
+        app.detail = Some(sample_graph_detail());
+        app.preview = Some(DataPreview {
+            columns: vec![],
+            rows: vec![],
+            page: 3,
+            has_more: false,
+        });
+        app.detail_filter_prompt = Some(DetailFilterPrompt::EnterValue {
+            column_index: 3,
+            operator: FilterOperator::Contains,
+            value: "page".into(),
+        });
+
+        let outcome = app
+            .handle_detail_filter_prompt_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(outcome, DetailFilterOutcome::ReloadPreview);
+        assert_eq!(app.preview.as_ref().unwrap().page, 0);
+        assert_eq!(app.detail_filters.len(), 1);
+        assert_eq!(app.detail_filters[0].column_name, "title");
+        assert_eq!(app.detail_filters[0].value.as_deref(), Some("page"));
+        assert!(app.detail_filter_prompt.is_none());
+    }
+
+    #[test]
+    fn null_filter_application_skips_value_entry() {
+        let mut app = test_app(Screen::Detail, false);
+        app.detail = Some(sample_graph_detail());
+        app.preview = Some(DataPreview {
+            columns: vec![],
+            rows: vec![],
+            page: 2,
+            has_more: false,
+        });
+        app.detail_filter_prompt = Some(DetailFilterPrompt::SelectOperator {
+            column_index: 2,
+            index: FilterOperator::ALL
+                .iter()
+                .position(|operator| *operator == FilterOperator::IsNull)
+                .unwrap(),
+        });
+
+        let outcome = app
+            .handle_detail_filter_prompt_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(outcome, DetailFilterOutcome::ReloadPreview);
+        assert_eq!(app.preview.as_ref().unwrap().page, 0);
+        assert_eq!(app.detail_filters.len(), 1);
+        assert_eq!(app.detail_filters[0].column_name, "owner_id");
+        assert_eq!(app.detail_filters[0].operator, FilterOperator::IsNull);
+        assert!(app.detail_filters[0].value.is_none());
+    }
+
+    #[test]
+    fn remove_selected_filter_clamps_index_and_resets_page() {
+        let mut app = test_app(Screen::Detail, false);
+        app.preview = Some(DataPreview {
+            columns: vec![],
+            rows: vec![],
+            page: 4,
+            has_more: false,
+        });
+        app.detail_filters = vec![
+            PreviewFilter {
+                column_name: "status".into(),
+                operator: FilterOperator::Equals,
+                value: Some("todo".into()),
+            },
+            PreviewFilter {
+                column_name: "title".into(),
+                operator: FilterOperator::Contains,
+                value: Some("page".into()),
+            },
+        ];
+        app.detail_filter_index = 1;
+
+        assert!(app.remove_selected_detail_filter());
+        assert_eq!(app.preview.as_ref().unwrap().page, 0);
+        assert_eq!(app.detail_filter_index, 0);
+        assert_eq!(app.detail_filters.len(), 1);
+        assert_eq!(app.detail_filters[0].column_name, "status");
+    }
+
+    #[tokio::test]
+    async fn q_is_filter_input_while_entering_filter_value() {
+        let mut app = test_app(Screen::Detail, false);
+        app.detail = Some(sample_graph_detail());
+        app.detail_filter_prompt = Some(DetailFilterPrompt::EnterValue {
+            column_index: 3,
+            operator: FilterOperator::Contains,
+            value: String::new(),
+        });
+
+        let should_quit = app
+            .handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(!should_quit);
+        assert!(matches!(
+            app.detail_filter_prompt,
+            Some(DetailFilterPrompt::EnterValue { ref value, .. }) if value == "q"
+        ));
     }
 
     #[tokio::test]
@@ -1858,6 +2477,16 @@ mod tests {
         app.detail_view = DetailView::Graph;
         app.relation_graph = Some(sample_relation_graph());
 
+        let visible_rows = app.graph_center_visible_rows();
+        let expected_scroll = 2usize.min(
+            app.detail
+                .as_ref()
+                .unwrap()
+                .columns
+                .len()
+                .saturating_sub(visible_rows),
+        );
+
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
             .await
             .unwrap();
@@ -1867,7 +2496,7 @@ mod tests {
 
         assert_eq!(app.graph_lane, GraphLane::Center);
         assert_eq!(app.graph_index, 0);
-        assert_eq!(app.graph_center_scroll, 2);
+        assert_eq!(app.graph_center_scroll, expected_scroll);
 
         app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
             .await
@@ -1875,7 +2504,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
             .await
             .unwrap();
-        assert_eq!(app.graph_center_scroll, 2);
+        assert_eq!(app.graph_center_scroll, expected_scroll);
     }
 
     #[tokio::test]

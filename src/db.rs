@@ -145,6 +145,72 @@ pub struct SortState {
     pub descending: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterOperator {
+    Equals,
+    NotEquals,
+    Contains,
+    StartsWith,
+    IsNull,
+    IsNotNull,
+}
+
+impl FilterOperator {
+    pub const ALL: [Self; 6] = [
+        Self::Equals,
+        Self::NotEquals,
+        Self::Contains,
+        Self::StartsWith,
+        Self::IsNull,
+        Self::IsNotNull,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Equals => "equals",
+            Self::NotEquals => "not equals",
+            Self::Contains => "contains",
+            Self::StartsWith => "starts with",
+            Self::IsNull => "is null",
+            Self::IsNotNull => "is not null",
+        }
+    }
+
+    pub fn requires_value(&self) -> bool {
+        !matches!(self, Self::IsNull | Self::IsNotNull)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewFilter {
+    pub column_name: String,
+    pub operator: FilterOperator,
+    pub value: Option<String>,
+}
+
+impl PreviewFilter {
+    pub fn summary(&self) -> String {
+        match self.operator {
+            FilterOperator::IsNull | FilterOperator::IsNotNull => {
+                format!("{} {}", self.column_name, self.operator.label())
+            }
+            _ => format!(
+                "{} {} {}",
+                self.column_name,
+                self.operator.label(),
+                self.value.as_deref().unwrap_or("")
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PreviewRequest {
+    pub sort: Option<SortState>,
+    pub filters: Vec<PreviewFilter>,
+    pub page: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct DataPreview {
     pub columns: Vec<String>,
@@ -187,6 +253,18 @@ struct RelationNodeSpec {
     table: TableRef,
     related_columns: Vec<String>,
     role: RelationNodeRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviewDialect {
+    Postgres,
+    Sqlite,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FilterClause {
+    sql: String,
+    bindings: Vec<String>,
 }
 
 pub enum Session {
@@ -288,12 +366,11 @@ impl Session {
     pub async fn load_preview(
         &self,
         table: &TableRef,
-        sort: Option<&SortState>,
-        page: usize,
+        request: &PreviewRequest,
     ) -> Result<DataPreview> {
         match self {
-            Self::Postgres(pool) => load_postgres_preview(pool, table, sort, page).await,
-            Self::Sqlite(pool) => load_sqlite_preview(pool, table, sort, page).await,
+            Self::Postgres(pool) => load_postgres_preview(pool, table, request).await,
+            Self::Sqlite(pool) => load_sqlite_preview(pool, table, request).await,
         }
     }
 
@@ -694,48 +771,58 @@ fn relation_role_rank(role: RelationNodeRole) -> u8 {
 async fn load_postgres_preview(
     pool: &PgPool,
     table: &TableRef,
-    sort: Option<&SortState>,
-    page: usize,
+    request: &PreviewRequest,
 ) -> Result<DataPreview> {
     let schema = table
         .schema
         .as_deref()
         .context("postgres preview requires schema")?;
     let columns = postgres_column_names(pool, table).await?;
-    let select_list = casted_select_list(&columns, true);
-    let order_clause = build_order_clause(sort, true);
+    let select_list = casted_select_list(&columns);
+    let filters = build_filter_clause(&request.filters, &columns, PreviewDialect::Postgres)?;
+    let order_clause = build_order_clause(request.sort.as_ref());
     let query = format!(
-        "SELECT {} FROM {}.{}{} LIMIT {} OFFSET {}",
+        "SELECT {} FROM {}.{}{}{} LIMIT {} OFFSET {}",
         select_list,
         quote_ident(schema),
         quote_ident(&table.name),
+        filters.sql,
         order_clause,
         PAGE_SIZE + 1,
-        page * PAGE_SIZE,
+        request.page * PAGE_SIZE,
     );
-    let rows = sqlx::query(&query).fetch_all(pool).await?;
-    preview_from_pg_rows(columns, rows, page)
+    let mut query = sqlx::query(&query);
+    for binding in filters.bindings {
+        query = query.bind(binding);
+    }
+    let rows = query.fetch_all(pool).await?;
+    preview_from_pg_rows(columns, rows, request.page)
 }
 
 async fn load_sqlite_preview(
     pool: &SqlitePool,
     table: &TableRef,
-    sort: Option<&SortState>,
-    page: usize,
+    request: &PreviewRequest,
 ) -> Result<DataPreview> {
     let columns = sqlite_column_names(pool, table).await?;
-    let select_list = casted_select_list(&columns, false);
-    let order_clause = build_order_clause(sort, false);
+    let select_list = casted_select_list(&columns);
+    let filters = build_filter_clause(&request.filters, &columns, PreviewDialect::Sqlite)?;
+    let order_clause = build_order_clause(request.sort.as_ref());
     let query = format!(
-        "SELECT {} FROM {}{} LIMIT {} OFFSET {}",
+        "SELECT {} FROM {}{}{} LIMIT {} OFFSET {}",
         select_list,
         quote_ident(&table.name),
+        filters.sql,
         order_clause,
         PAGE_SIZE + 1,
-        page * PAGE_SIZE,
+        request.page * PAGE_SIZE,
     );
-    let rows = sqlx::query(&query).fetch_all(pool).await?;
-    preview_from_sqlite_rows(columns, rows, page)
+    let mut query = sqlx::query(&query);
+    for binding in filters.bindings {
+        query = query.bind(binding);
+    }
+    let rows = query.fetch_all(pool).await?;
+    preview_from_sqlite_rows(columns, rows, request.page)
 }
 
 async fn postgres_column_names(pool: &PgPool, table: &TableRef) -> Result<Vec<String>> {
@@ -762,7 +849,7 @@ async fn sqlite_column_names(pool: &SqlitePool, table: &TableRef) -> Result<Vec<
     Ok(rows.into_iter().map(|row| row.get("name")).collect())
 }
 
-fn casted_select_list(columns: &[String], _postgres: bool) -> String {
+fn casted_select_list(columns: &[String]) -> String {
     columns
         .iter()
         .map(|name| {
@@ -773,7 +860,7 @@ fn casted_select_list(columns: &[String], _postgres: bool) -> String {
         .join(", ")
 }
 
-fn build_order_clause(sort: Option<&SortState>, _postgres: bool) -> String {
+fn build_order_clause(sort: Option<&SortState>) -> String {
     match sort {
         Some(sort) => format!(
             " ORDER BY {} {}",
@@ -781,6 +868,90 @@ fn build_order_clause(sort: Option<&SortState>, _postgres: bool) -> String {
             if sort.descending { "DESC" } else { "ASC" }
         ),
         None => String::new(),
+    }
+}
+
+fn build_filter_clause(
+    filters: &[PreviewFilter],
+    columns: &[String],
+    dialect: PreviewDialect,
+) -> Result<FilterClause> {
+    let allowed_columns = columns.iter().cloned().collect::<HashSet<_>>();
+    let mut clauses = Vec::new();
+    let mut bindings = Vec::new();
+
+    for filter in filters {
+        clauses.push(build_filter_condition(
+            filter,
+            &allowed_columns,
+            dialect,
+            &mut bindings,
+        )?);
+    }
+
+    if clauses.is_empty() {
+        return Ok(FilterClause::default());
+    }
+
+    Ok(FilterClause {
+        sql: format!(" WHERE {}", clauses.join(" AND ")),
+        bindings,
+    })
+}
+
+fn build_filter_condition(
+    filter: &PreviewFilter,
+    allowed_columns: &HashSet<String>,
+    dialect: PreviewDialect,
+    bindings: &mut Vec<String>,
+) -> Result<String> {
+    if !allowed_columns.contains(&filter.column_name) {
+        return Err(anyhow!("unknown filter column '{}'", filter.column_name));
+    }
+
+    let ident = quote_ident(&filter.column_name);
+    Ok(match filter.operator {
+        FilterOperator::Equals => {
+            let placeholder = push_binding(dialect, bindings, required_filter_value(filter)?);
+            format!("CAST({ident} AS TEXT) = {placeholder}")
+        }
+        FilterOperator::NotEquals => {
+            let placeholder = push_binding(dialect, bindings, required_filter_value(filter)?);
+            format!("CAST({ident} AS TEXT) <> {placeholder}")
+        }
+        FilterOperator::Contains => {
+            let placeholder = push_binding(
+                dialect,
+                bindings,
+                format!("%{}%", required_filter_value(filter)?),
+            );
+            format!("LOWER(CAST({ident} AS TEXT)) LIKE LOWER({placeholder})")
+        }
+        FilterOperator::StartsWith => {
+            let placeholder = push_binding(
+                dialect,
+                bindings,
+                format!("{}%", required_filter_value(filter)?),
+            );
+            format!("LOWER(CAST({ident} AS TEXT)) LIKE LOWER({placeholder})")
+        }
+        FilterOperator::IsNull => format!("{ident} IS NULL"),
+        FilterOperator::IsNotNull => format!("{ident} IS NOT NULL"),
+    })
+}
+
+fn required_filter_value(filter: &PreviewFilter) -> Result<String> {
+    filter
+        .value
+        .clone()
+        .context("filter operator requires a value")
+}
+
+fn push_binding(dialect: PreviewDialect, bindings: &mut Vec<String>, value: String) -> String {
+    bindings.push(value);
+    match dialect {
+        PreviewDialect::Postgres => format!("${}", bindings.len()),
+        PreviewDialect::Sqlite => "?".into(),
     }
 }
 
@@ -941,6 +1112,167 @@ mod tests {
             center.related_columns,
             vec!["project_id", "project_id_backup", "id"]
         );
+    }
+
+    #[test]
+    fn postgres_filter_clause_uses_numbered_placeholders() {
+        let filters = vec![
+            PreviewFilter {
+                column_name: "status".into(),
+                operator: FilterOperator::Equals,
+                value: Some("todo".into()),
+            },
+            PreviewFilter {
+                column_name: "title".into(),
+                operator: FilterOperator::Contains,
+                value: Some("page".into()),
+            },
+            PreviewFilter {
+                column_name: "assignee_id".into(),
+                operator: FilterOperator::IsNull,
+                value: None,
+            },
+        ];
+        let clause = build_filter_clause(
+            &filters,
+            &["status".into(), "title".into(), "assignee_id".into()],
+            PreviewDialect::Postgres,
+        )
+        .unwrap();
+
+        assert_eq!(
+            clause.sql,
+            " WHERE CAST(\"status\" AS TEXT) = $1 AND LOWER(CAST(\"title\" AS TEXT)) LIKE LOWER($2) AND \"assignee_id\" IS NULL"
+        );
+        assert_eq!(clause.bindings, vec!["todo", "%page%"]);
+    }
+
+    #[test]
+    fn sqlite_filter_clause_uses_qmark_placeholders_and_bind_order() {
+        let filters = vec![
+            PreviewFilter {
+                column_name: "title".into(),
+                operator: FilterOperator::StartsWith,
+                value: Some("Render".into()),
+            },
+            PreviewFilter {
+                column_name: "status".into(),
+                operator: FilterOperator::NotEquals,
+                value: Some("done".into()),
+            },
+        ];
+        let clause = build_filter_clause(
+            &filters,
+            &["title".into(), "status".into()],
+            PreviewDialect::Sqlite,
+        )
+        .unwrap();
+
+        assert_eq!(
+            clause.sql,
+            " WHERE LOWER(CAST(\"title\" AS TEXT)) LIKE LOWER(?) AND CAST(\"status\" AS TEXT) <> ?"
+        );
+        assert_eq!(clause.bindings, vec!["Render%", "done"]);
+    }
+
+    #[test]
+    fn build_filter_clause_rejects_unknown_columns() {
+        let err = build_filter_clause(
+            &[PreviewFilter {
+                column_name: "missing".into(),
+                operator: FilterOperator::Equals,
+                value: Some("todo".into()),
+            }],
+            &["status".into()],
+            PreviewDialect::Sqlite,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("unknown filter column 'missing'"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_filtered_preview_uses_sample_schema() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("sample")
+            .join("readgrid_demo.db");
+        let session = Session::connect(&ConnectionProfile {
+            name: "sample".into(),
+            kind: DatabaseKind::Sqlite,
+            url: None,
+            path: Some(path),
+        })
+        .await
+        .unwrap();
+
+        let todo_preview = session
+            .load_preview(
+                &sample_table("tasks"),
+                &PreviewRequest {
+                    sort: Some(SortState {
+                        column_name: "title".into(),
+                        descending: false,
+                    }),
+                    filters: vec![PreviewFilter {
+                        column_name: "status".into(),
+                        operator: FilterOperator::Equals,
+                        value: Some("todo".into()),
+                    }],
+                    page: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let title_index = todo_preview
+            .columns
+            .iter()
+            .position(|name| name == "title")
+            .unwrap();
+        let status_index = todo_preview
+            .columns
+            .iter()
+            .position(|name| name == "status")
+            .unwrap();
+
+        assert_eq!(todo_preview.rows.len(), 2);
+        assert_eq!(
+            todo_preview.rows[0][title_index],
+            "Add sample data preview paging"
+        );
+        assert_eq!(
+            todo_preview.rows[1][title_index],
+            "Render relationship panel"
+        );
+        assert!(
+            todo_preview
+                .rows
+                .iter()
+                .all(|row| row[status_index] == "todo")
+        );
+
+        let null_preview = session
+            .load_preview(
+                &sample_table("tasks"),
+                &PreviewRequest {
+                    sort: None,
+                    filters: vec![PreviewFilter {
+                        column_name: "assignee_id".into(),
+                        operator: FilterOperator::IsNull,
+                        value: None,
+                    }],
+                    page: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let assignee_index = null_preview
+            .columns
+            .iter()
+            .position(|name| name == "assignee_id")
+            .unwrap();
+
+        assert_eq!(null_preview.rows.len(), 1);
+        assert_eq!(null_preview.rows[0][assignee_index], "NULL");
     }
 
     #[tokio::test]
