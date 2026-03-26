@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -256,6 +256,27 @@ impl DataPreview {
             .position(|column| column == column_name)?;
         self.rows.get(row_index)?.cells.get(column_index)
     }
+}
+
+pub fn write_preview_csv(preview: &DataPreview, path: &Path) -> Result<()> {
+    let file = std::fs::File::create(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    let mut writer = csv::Writer::from_writer(file);
+
+    writer
+        .write_record(preview.columns.iter())
+        .with_context(|| format!("failed to write CSV header to {}", path.display()))?;
+
+    for row in &preview.rows {
+        writer
+            .write_record(row.cells.iter().map(|cell| cell.display_value.as_str()))
+            .with_context(|| format!("failed to write CSV row to {}", path.display()))?;
+    }
+
+    writer
+        .flush()
+        .with_context(|| format!("failed to flush CSV writer for {}", path.display()))?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1150,12 +1171,47 @@ fn quote_ident(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use super::*;
 
     fn sample_table(name: &str) -> TableRef {
         TableRef {
             schema: None,
             name: name.into(),
+        }
+    }
+
+    fn temp_csv_path(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "readgrid_{name}_{}_{}.csv",
+            std::process::id(),
+            unique
+        ))
+    }
+
+    fn sample_csv_preview(rows: Vec<Vec<Option<&str>>>) -> DataPreview {
+        DataPreview {
+            columns: vec!["id".into(), "title".into(), "notes".into()],
+            rows: rows
+                .into_iter()
+                .map(|cells| PreviewRow {
+                    cells: cells
+                        .into_iter()
+                        .map(|raw| PreviewCell::from_raw(raw.map(str::to_string)))
+                        .collect(),
+                })
+                .collect(),
+            page: 0,
+            has_more: false,
         }
     }
 
@@ -1331,6 +1387,88 @@ mod tests {
         assert_eq!(missing.raw_value, None);
         assert_eq!(present.display_value, "literal");
         assert_eq!(present.raw_value.as_deref(), Some("literal"));
+    }
+
+    #[test]
+    fn write_preview_csv_writes_headers_and_rendered_nulls() {
+        let path = temp_csv_path("rendered_nulls");
+        let preview = sample_csv_preview(vec![vec![Some("1"), Some("alpha"), None]]);
+
+        write_preview_csv(&preview, &path).unwrap();
+
+        let mut reader = csv::Reader::from_path(&path).unwrap();
+        let headers = reader.headers().unwrap().clone();
+        let rows = reader
+            .records()
+            .map(|row| row.unwrap().iter().map(str::to_string).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        fs::remove_file(&path).ok();
+
+        assert_eq!(
+            headers.iter().collect::<Vec<_>>(),
+            vec!["id", "title", "notes"]
+        );
+        assert_eq!(
+            rows,
+            vec![vec![
+                String::from("1"),
+                String::from("alpha"),
+                String::from("NULL"),
+            ]]
+        );
+    }
+
+    #[test]
+    fn write_preview_csv_escapes_commas_quotes_and_newlines() {
+        let path = temp_csv_path("escaping");
+        let preview = sample_csv_preview(vec![vec![
+            Some("1"),
+            Some("comma,quote"),
+            Some("needs \"quotes\", commas,\nand newlines"),
+        ]]);
+
+        write_preview_csv(&preview, &path).unwrap();
+
+        let raw = fs::read_to_string(&path).unwrap();
+        let mut reader = csv::Reader::from_path(&path).unwrap();
+        let rows = reader
+            .records()
+            .map(|row| row.unwrap().iter().map(str::to_string).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        fs::remove_file(&path).ok();
+
+        assert!(raw.contains("\"comma,quote\""));
+        assert!(raw.contains("\"needs \"\"quotes\"\", commas,"));
+        assert_eq!(
+            rows,
+            vec![vec![
+                String::from("1"),
+                String::from("comma,quote"),
+                String::from("needs \"quotes\", commas,\nand newlines"),
+            ]]
+        );
+    }
+
+    #[test]
+    fn write_preview_csv_writes_header_only_for_empty_preview() {
+        let path = temp_csv_path("header_only");
+        let preview = sample_csv_preview(Vec::new());
+
+        write_preview_csv(&preview, &path).unwrap();
+
+        let mut reader = csv::Reader::from_path(&path).unwrap();
+        let headers = reader.headers().unwrap().clone();
+        let rows = reader
+            .records()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        fs::remove_file(&path).ok();
+
+        assert_eq!(
+            headers.iter().collect::<Vec<_>>(),
+            vec!["id", "title", "notes"]
+        );
+        assert!(rows.is_empty());
     }
 
     #[test]

@@ -24,6 +24,7 @@ use crate::{
         ConnectionProfile, DataPreview, DatabaseKind, DrillThroughAction, FilterOperator,
         ForeignKeyMeta, PreviewFilter, PreviewRequest, RelationGraph, RelationNode,
         RelationNodeRole, Session, SortState, TableDetail, TableRef, build_drill_through_actions,
+        write_preview_csv,
     },
     mcp::McpContext,
 };
@@ -80,6 +81,12 @@ enum DetailFilterPrompt {
     },
 }
 
+#[derive(Debug, Clone)]
+enum DetailExportPrompt {
+    EnterPath { value: String },
+    ConfirmOverwrite { value: String },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DetailFilterOutcome {
     None,
@@ -122,6 +129,7 @@ pub struct App {
     detail_filters: Vec<PreviewFilter>,
     detail_filter_index: usize,
     detail_filter_prompt: Option<DetailFilterPrompt>,
+    detail_export_prompt: Option<DetailExportPrompt>,
     detail_drill_actions: Option<Vec<DrillThroughAction>>,
     detail_drill_index: usize,
     detail_nav_stack: Vec<DetailNavStackEntry>,
@@ -177,6 +185,7 @@ impl App {
             detail_filters: Vec::new(),
             detail_filter_index: 0,
             detail_filter_prompt: None,
+            detail_export_prompt: None,
             detail_drill_actions: None,
             detail_drill_index: 0,
             detail_nav_stack: Vec::new(),
@@ -303,6 +312,11 @@ impl App {
             return self.handle_graph_key(key).await;
         }
 
+        if self.detail_export_prompt.is_some() {
+            self.handle_detail_export_prompt_key(key);
+            return Ok(false);
+        }
+
         if self.detail_filter_prompt.is_some() {
             if self.handle_detail_filter_prompt_key(key)? == DetailFilterOutcome::ReloadPreview {
                 self.reload_preview().await?;
@@ -328,6 +342,7 @@ impl App {
             KeyCode::Char('g') => {
                 self.enter_graph_view().await?;
             }
+            KeyCode::Char('e') => self.start_detail_export_prompt(),
             KeyCode::Char('f') => self.start_detail_filter_prompt(),
             KeyCode::Char('h') | KeyCode::Left => self.move_detail_filter_selection(-1),
             KeyCode::Char('l') | KeyCode::Right => self.move_detail_filter_selection(1),
@@ -439,6 +454,94 @@ impl App {
                 self.clamp_table_index();
             }
             _ => {}
+        }
+    }
+
+    fn start_detail_export_prompt(&mut self) {
+        if self.preview.is_none() {
+            self.status = "No preview data loaded for export.".into();
+            return;
+        }
+
+        self.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+            value: String::new(),
+        });
+        self.status = "Type a CSV path and press Enter.".into();
+    }
+
+    fn handle_detail_export_prompt_key(&mut self, key: KeyEvent) {
+        let Some(prompt) = self.detail_export_prompt.clone() else {
+            return;
+        };
+
+        match prompt {
+            DetailExportPrompt::EnterPath { mut value } => match key.code {
+                KeyCode::Esc => {
+                    self.detail_export_prompt = None;
+                    self.status = "Canceled CSV export.".into();
+                }
+                KeyCode::Backspace => {
+                    value.pop();
+                    self.detail_export_prompt = Some(DetailExportPrompt::EnterPath { value });
+                }
+                KeyCode::Enter => {
+                    let trimmed = value.trim();
+                    if trimmed.is_empty() {
+                        self.detail_export_prompt = Some(DetailExportPrompt::EnterPath { value });
+                        self.status = "Enter a non-empty CSV path or press Esc to cancel.".into();
+                    } else {
+                        let path = PathBuf::from(trimmed);
+                        if path.exists() {
+                            self.detail_export_prompt =
+                                Some(DetailExportPrompt::ConfirmOverwrite { value });
+                            self.status = format!(
+                                "{} already exists. Press Enter to overwrite or Esc to keep editing.",
+                                path.display()
+                            );
+                        } else {
+                            self.export_preview_to_path(value);
+                        }
+                    }
+                }
+                KeyCode::Char(ch) => {
+                    value.push(ch);
+                    self.detail_export_prompt = Some(DetailExportPrompt::EnterPath { value });
+                }
+                _ => {
+                    self.detail_export_prompt = Some(DetailExportPrompt::EnterPath { value });
+                }
+            },
+            DetailExportPrompt::ConfirmOverwrite { value } => match key.code {
+                KeyCode::Esc => {
+                    self.detail_export_prompt = Some(DetailExportPrompt::EnterPath { value });
+                    self.status = "Returned to CSV path entry.".into();
+                }
+                KeyCode::Enter => self.export_preview_to_path(value),
+                _ => {
+                    self.detail_export_prompt =
+                        Some(DetailExportPrompt::ConfirmOverwrite { value });
+                }
+            },
+        }
+    }
+
+    fn export_preview_to_path(&mut self, value: String) {
+        let path = PathBuf::from(value.trim());
+        let Some(preview) = self.preview.as_ref() else {
+            self.detail_export_prompt = None;
+            self.status = "No preview data loaded for export.".into();
+            return;
+        };
+
+        match write_preview_csv(preview, &path) {
+            Ok(()) => {
+                self.detail_export_prompt = None;
+                self.status = format!("Exported CSV to {}.", path.display());
+            }
+            Err(error) => {
+                self.detail_export_prompt = Some(DetailExportPrompt::EnterPath { value });
+                self.status = format!("CSV export failed: {error}");
+            }
         }
     }
 
@@ -827,6 +930,7 @@ impl App {
         self.detail_filters.clear();
         self.detail_filter_index = 0;
         self.detail_filter_prompt = None;
+        self.detail_export_prompt = None;
         self.detail_drill_actions = None;
         self.detail_drill_index = 0;
         self.detail_nav_stack.clear();
@@ -886,6 +990,7 @@ impl App {
         self.detail_filters.clear();
         self.detail_filter_index = 0;
         self.detail_filter_prompt = None;
+        self.detail_export_prompt = None;
         self.detail_drill_actions = None;
         self.detail_drill_index = 0;
         self.detail_nav_stack.clear();
@@ -945,6 +1050,7 @@ impl App {
         self.detail_filters = context.filters;
         self.detail_filter_index = self.detail_filters.len().saturating_sub(1);
         self.detail_filter_prompt = None;
+        self.detail_export_prompt = None;
         self.detail_drill_actions = None;
         self.detail_drill_index = 0;
         if clear_drill_stack {
@@ -1038,6 +1144,7 @@ impl App {
     fn is_input_mode_active(&self) -> bool {
         self.table_search_mode
             || self.detail_filter_prompt.is_some()
+            || self.detail_export_prompt.is_some()
             || self.detail_drill_actions.is_some()
     }
 
@@ -1061,6 +1168,22 @@ impl App {
             }
             Screen::Detail
                 if matches!(
+                    self.detail_export_prompt,
+                    Some(DetailExportPrompt::EnterPath { .. })
+                ) =>
+            {
+                "Type path | Enter export | Esc cancel"
+            }
+            Screen::Detail
+                if matches!(
+                    self.detail_export_prompt,
+                    Some(DetailExportPrompt::ConfirmOverwrite { .. })
+                ) =>
+            {
+                "Enter overwrite | Esc edit path"
+            }
+            Screen::Detail
+                if matches!(
                     self.detail_filter_prompt,
                     Some(DetailFilterPrompt::EnterValue { .. })
                 ) =>
@@ -1074,7 +1197,7 @@ impl App {
                 "Up/Down move | Enter open relation | Esc cancel"
             }
             Screen::Detail => {
-                "Up/Down row | Enter relations | f add filter | h/l pick filter | x remove | c clear | [ ] sort | s order | n/p page | g graph | Esc back | q quit"
+                "Up/Down row | Enter relations | e export | f add filter | h/l pick filter | x remove | c clear | [ ] sort | s order | n/p page | g graph | Esc back | q quit"
             }
         }
     }
@@ -1325,10 +1448,45 @@ impl App {
         if let Some(prompt) = &self.detail_filter_prompt {
             self.render_detail_filter_prompt(frame, chunks[0], detail, prompt);
         }
+        if let Some(prompt) = &self.detail_export_prompt {
+            self.render_detail_export_prompt(frame, chunks[0], prompt);
+        }
         if let Some(actions) = &self.detail_drill_actions {
             self.render_detail_drill_prompt(frame, chunks[0], actions);
         }
         frame.render_widget(status_bar(&self.status, self.controls_hint()), chunks[1]);
+    }
+
+    fn render_detail_export_prompt(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        prompt: &DetailExportPrompt,
+    ) {
+        let popup = centered_rect(70, 9, area);
+        frame.render_widget(Clear, popup);
+
+        let widget = match prompt {
+            DetailExportPrompt::EnterPath { value } => Paragraph::new(vec![
+                Line::from("Export the visible preview page as CSV."),
+                Line::from(""),
+                Line::from(format!("Path: {value}")),
+            ])
+            .block(Block::default().title("Export CSV").borders(Borders::ALL)),
+            DetailExportPrompt::ConfirmOverwrite { value } => Paragraph::new(vec![
+                Line::from("This file already exists."),
+                Line::from("Press Enter to overwrite or Esc to return."),
+                Line::from(""),
+                Line::from(format!("Path: {}", value.trim())),
+            ])
+            .block(
+                Block::default()
+                    .title("Overwrite CSV?")
+                    .borders(Borders::ALL),
+            ),
+        }
+        .wrap(Wrap { trim: false });
+        frame.render_widget(widget, popup);
     }
 
     fn render_detail_filter_prompt(
@@ -2192,6 +2350,11 @@ fn render_preview<'a>(
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use super::*;
     use crossterm::event::KeyModifiers;
 
@@ -2232,6 +2395,7 @@ mod tests {
             detail_filters: Vec::new(),
             detail_filter_index: 0,
             detail_filter_prompt: None,
+            detail_export_prompt: None,
             detail_drill_actions: None,
             detail_drill_index: 0,
             detail_nav_stack: Vec::new(),
@@ -2395,6 +2559,26 @@ mod tests {
             ],
             page: 0,
             has_more: false,
+        }
+    }
+
+    fn temp_csv_path(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "readgrid_app_{name}_{}_{}.csv",
+            std::process::id(),
+            unique
+        ))
+    }
+
+    async fn type_text(app: &mut App, text: &str) {
+        for ch in text.chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .await
+                .unwrap();
         }
     }
 
@@ -2685,6 +2869,157 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn e_opens_export_prompt_from_detail_view() {
+        let mut app = test_app(Screen::Detail, false);
+        app.detail = Some(sample_graph_detail());
+        app.preview = Some(sample_preview());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            app.detail_export_prompt,
+            Some(DetailExportPrompt::EnterPath { ref value }) if value.is_empty()
+        ));
+        assert_eq!(app.status, "Type a CSV path and press Enter.");
+    }
+
+    #[tokio::test]
+    async fn q_is_export_input_while_entering_csv_path() {
+        let mut app = test_app(Screen::Detail, false);
+        app.detail = Some(sample_graph_detail());
+        app.preview = Some(sample_preview());
+        app.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+            value: String::new(),
+        });
+
+        let should_quit = app
+            .handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(!should_quit);
+        assert!(matches!(
+            app.detail_export_prompt,
+            Some(DetailExportPrompt::EnterPath { ref value }) if value == "q"
+        ));
+    }
+
+    #[tokio::test]
+    async fn blank_export_path_is_rejected() {
+        let mut app = test_app(Screen::Detail, false);
+        app.detail = Some(sample_graph_detail());
+        app.preview = Some(sample_preview());
+        app.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+            value: String::new(),
+        });
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            app.detail_export_prompt,
+            Some(DetailExportPrompt::EnterPath { ref value }) if value.is_empty()
+        ));
+        assert_eq!(
+            app.status,
+            "Enter a non-empty CSV path or press Esc to cancel."
+        );
+    }
+
+    #[tokio::test]
+    async fn export_existing_file_requires_confirmation_before_overwrite() {
+        let mut app = test_app(Screen::Detail, false);
+        app.detail = Some(sample_graph_detail());
+        app.preview = Some(sample_preview());
+        let path = temp_csv_path("confirm");
+        fs::write(&path, "old").unwrap();
+        let value = path.display().to_string();
+        app.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+            value: value.clone(),
+        });
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            app.detail_export_prompt,
+            Some(DetailExportPrompt::ConfirmOverwrite { value: ref prompt_value }) if prompt_value == &value
+        ));
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            app.detail_export_prompt,
+            Some(DetailExportPrompt::EnterPath { value: ref prompt_value }) if prompt_value == &value
+        ));
+        fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn export_prompt_writes_csv_and_updates_status() {
+        let mut app = test_app(Screen::Detail, false);
+        app.detail = Some(sample_graph_detail());
+        app.preview = Some(sample_preview());
+        let path = temp_csv_path("success");
+        let value = path.display().to_string();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        type_text(&mut app, &value).await;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let mut reader = csv::Reader::from_path(&path).unwrap();
+        let headers = reader.headers().unwrap().clone();
+        let rows = reader
+            .records()
+            .map(|row| row.unwrap().iter().map(str::to_string).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        fs::remove_file(&path).ok();
+
+        assert!(app.detail_export_prompt.is_none());
+        assert_eq!(app.status, format!("Exported CSV to {value}."));
+        assert_eq!(
+            headers.iter().collect::<Vec<_>>(),
+            vec!["id", "project_id", "owner_id", "title"]
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][2], "NULL");
+    }
+
+    #[tokio::test]
+    async fn export_failure_keeps_prompt_open_and_reports_status() {
+        let mut app = test_app(Screen::Detail, false);
+        app.detail = Some(sample_graph_detail());
+        app.preview = Some(sample_preview());
+        let path = std::env::temp_dir()
+            .join("readgrid_missing_dir")
+            .join("export.csv");
+        let value = path.display().to_string();
+        app.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+            value: value.clone(),
+        });
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            app.detail_export_prompt,
+            Some(DetailExportPrompt::EnterPath { value: ref prompt_value }) if prompt_value == &value
+        ));
+        assert!(app.status.starts_with("CSV export failed: "));
+    }
+
+    #[tokio::test]
     async fn up_down_moves_preview_row_selection() {
         let mut app = test_app(Screen::Detail, false);
         app.detail = Some(sample_graph_detail());
@@ -2912,6 +3247,75 @@ mod tests {
         assert_eq!(app.graph_lane, GraphLane::Center);
         assert_eq!(app.graph_center_scroll, 1);
         assert_eq!(app.status, "Already centered on the current table.");
+    }
+
+    #[tokio::test]
+    async fn export_sample_preview_uses_current_filtered_rows() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("sample")
+            .join("readgrid_demo.db");
+        let session = Session::connect(&ConnectionProfile {
+            name: "sample".into(),
+            kind: DatabaseKind::Sqlite,
+            url: None,
+            path: Some(path),
+        })
+        .await
+        .unwrap();
+
+        let mut app = test_app(Screen::Detail, false);
+        app.session = Some(session);
+        app.load_table_detail(
+            TableRef {
+                schema: None,
+                name: "tasks".into(),
+            },
+            DetailView::Table,
+        )
+        .await
+        .unwrap();
+        app.detail_filters = vec![PreviewFilter {
+            column_name: "status".into(),
+            operator: FilterOperator::Equals,
+            value: Some("todo".into()),
+        }];
+        app.sort_index = 0;
+        app.sort_desc = false;
+        app.reload_preview().await.unwrap();
+
+        let expected_preview = app.preview.clone().unwrap();
+        let export_path = temp_csv_path("sample_preview");
+        let export_value = export_path.display().to_string();
+        app.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+            value: export_value.clone(),
+        });
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let mut reader = csv::Reader::from_path(&export_path).unwrap();
+        let headers = reader.headers().unwrap().clone();
+        let rows = reader
+            .records()
+            .map(|row| row.unwrap().iter().map(str::to_string).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        fs::remove_file(&export_path).ok();
+
+        assert!(app.detail_export_prompt.is_none());
+        assert_eq!(app.status, format!("Exported CSV to {export_value}."));
+        assert_eq!(
+            headers.iter().map(str::to_string).collect::<Vec<_>>(),
+            expected_preview.columns
+        );
+        assert_eq!(
+            rows,
+            expected_preview
+                .rows
+                .iter()
+                .map(|row| row.display_values())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]
