@@ -943,7 +943,11 @@ impl App {
 
         frame.render_widget(
             Paragraph::new(incoming)
-                .block(Block::default().title("Incoming").borders(Borders::ALL))
+                .block(
+                    Block::default()
+                        .title("Incoming (-> center)")
+                        .borders(Borders::ALL),
+                )
                 .wrap(Wrap { trim: false }),
             lanes[0],
         );
@@ -955,7 +959,11 @@ impl App {
         );
         frame.render_widget(
             Paragraph::new(outgoing)
-                .block(Block::default().title("Outgoing").borders(Borders::ALL))
+                .block(
+                    Block::default()
+                        .title("Outgoing (center ->)")
+                        .borders(Borders::ALL),
+                )
                 .wrap(Wrap { trim: false }),
             lanes[2],
         );
