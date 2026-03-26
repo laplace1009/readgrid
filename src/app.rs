@@ -13,16 +13,17 @@ use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, Wrap,
+        Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
+        Wrap,
     },
 };
 
 use crate::{
     config::ConfigStore,
     db::{
-        ConnectionProfile, DataPreview, DatabaseKind, FilterOperator, ForeignKeyMeta,
-        PreviewFilter, PreviewRequest, RelationGraph, RelationNode, RelationNodeRole, Session,
-        SortState, TableDetail, TableRef,
+        ConnectionProfile, DataPreview, DatabaseKind, DrillThroughAction, FilterOperator,
+        ForeignKeyMeta, PreviewFilter, PreviewRequest, RelationGraph, RelationNode,
+        RelationNodeRole, Session, SortState, TableDetail, TableRef, build_drill_through_actions,
     },
     mcp::McpContext,
 };
@@ -92,6 +93,16 @@ struct ConnectionCandidate {
     preferred_schema: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct DetailNavStackEntry {
+    table: TableRef,
+    filters: Vec<PreviewFilter>,
+    sort_index: usize,
+    sort_desc: bool,
+    page: usize,
+    selected_row: usize,
+}
+
 pub struct App {
     config: ConfigStore,
     screen: Screen,
@@ -111,11 +122,15 @@ pub struct App {
     detail_filters: Vec<PreviewFilter>,
     detail_filter_index: usize,
     detail_filter_prompt: Option<DetailFilterPrompt>,
+    detail_drill_actions: Option<Vec<DrillThroughAction>>,
+    detail_drill_index: usize,
+    detail_nav_stack: Vec<DetailNavStackEntry>,
     relation_graph: Option<RelationGraph>,
     graph_lane: GraphLane,
     graph_index: usize,
     graph_center_scroll: usize,
     preview: Option<DataPreview>,
+    preview_row_index: usize,
     sort_index: usize,
     sort_desc: bool,
     status: String,
@@ -162,11 +177,15 @@ impl App {
             detail_filters: Vec::new(),
             detail_filter_index: 0,
             detail_filter_prompt: None,
+            detail_drill_actions: None,
+            detail_drill_index: 0,
+            detail_nav_stack: Vec::new(),
             relation_graph: None,
             graph_lane: GraphLane::Center,
             graph_index: 0,
             graph_center_scroll: 0,
             preview: None,
+            preview_row_index: 0,
             sort_index: 0,
             sort_desc: false,
             status,
@@ -291,11 +310,21 @@ impl App {
             return Ok(false);
         }
 
+        if self.detail_drill_actions.is_some() {
+            self.handle_detail_drill_key(key).await?;
+            return Ok(false);
+        }
+
         match key.code {
             KeyCode::Esc => {
-                self.screen = Screen::Browser;
-                self.status = "Returned to table browser.".into();
+                if !self.pop_detail_nav_stack().await? {
+                    self.screen = Screen::Browser;
+                    self.status = "Returned to table browser.".into();
+                }
             }
+            KeyCode::Up | KeyCode::Char('k') => self.move_preview_row(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_preview_row(1),
+            KeyCode::Enter => self.start_detail_drill_prompt(),
             KeyCode::Char('g') => {
                 self.enter_graph_view().await?;
             }
@@ -411,6 +440,96 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    async fn handle_detail_drill_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc => {
+                self.detail_drill_actions = None;
+                self.detail_drill_index = 0;
+                self.status = "Canceled relation picker.".into();
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.move_detail_drill_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_detail_drill_selection(1),
+            KeyCode::Enter => self.confirm_detail_drill_selection().await?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn start_detail_drill_prompt(&mut self) {
+        let Some(detail) = &self.detail else {
+            self.status = "No table detail loaded for drill-through.".into();
+            return;
+        };
+        let Some(preview) = &self.preview else {
+            self.status = "No preview data loaded for drill-through.".into();
+            return;
+        };
+        if preview.rows.is_empty() {
+            self.status = "No preview rows available for drill-through.".into();
+            return;
+        }
+
+        let actions = build_drill_through_actions(detail, preview, self.preview_row_index);
+        if actions.is_empty() {
+            self.status = "No relationships available for this table.".into();
+            return;
+        }
+
+        self.detail_drill_index = 0;
+        self.detail_drill_actions = Some(actions);
+        self.status = "Choose a relationship and press Enter.".into();
+    }
+
+    fn move_detail_drill_selection(&mut self, delta: isize) {
+        let len = self
+            .detail_drill_actions
+            .as_ref()
+            .map(|actions| actions.len())
+            .unwrap_or(0);
+        self.detail_drill_index = move_index(self.detail_drill_index, len, delta);
+    }
+
+    async fn confirm_detail_drill_selection(&mut self) -> Result<()> {
+        let action = self
+            .detail_drill_actions
+            .as_ref()
+            .and_then(|actions| actions.get(self.detail_drill_index))
+            .cloned()
+            .ok_or_else(|| anyhow!("no drill-through action is selected"))?;
+
+        if !action.is_available() {
+            self.status = action
+                .unavailable_reason
+                .unwrap_or_else(|| "That relationship is unavailable for the selected row.".into());
+            return Ok(());
+        }
+
+        let snapshot = self
+            .current_detail_nav_entry()
+            .ok_or_else(|| anyhow!("no detail context available to push"))?;
+        let target_table = action.target_table.clone();
+        let target_filter = action
+            .target_filter
+            .clone()
+            .ok_or_else(|| anyhow!("selected drill-through action is missing a filter"))?;
+        self.detail_nav_stack.push(snapshot);
+        self.open_detail_context(
+            DetailNavStackEntry {
+                table: target_table.clone(),
+                filters: vec![target_filter],
+                sort_index: 0,
+                sort_desc: false,
+                page: 0,
+                selected_row: 0,
+            },
+            DetailView::Table,
+            false,
+        )
+        .await?;
+        self.status = format!("Opened related rows in {}.", target_table.display_name());
+        Ok(())
     }
 
     fn start_detail_filter_prompt(&mut self) {
@@ -616,6 +735,64 @@ impl App {
         true
     }
 
+    fn move_preview_row(&mut self, delta: isize) {
+        let len = self
+            .preview
+            .as_ref()
+            .map(|preview| preview.rows.len())
+            .unwrap_or(0);
+        self.preview_row_index = move_index(self.preview_row_index, len, delta);
+    }
+
+    fn clamp_preview_row_index(&mut self) {
+        let len = self
+            .preview
+            .as_ref()
+            .map(|preview| preview.rows.len())
+            .unwrap_or(0);
+        if len == 0 {
+            self.preview_row_index = 0;
+        } else if self.preview_row_index >= len {
+            self.preview_row_index = len - 1;
+        }
+    }
+
+    fn selected_preview_row(&self) -> Option<usize> {
+        let preview = self.preview.as_ref()?;
+        if preview.rows.is_empty() {
+            None
+        } else {
+            Some(self.preview_row_index.min(preview.rows.len() - 1))
+        }
+    }
+
+    fn current_detail_nav_entry(&self) -> Option<DetailNavStackEntry> {
+        let table = self.detail.as_ref()?.table.clone();
+        Some(DetailNavStackEntry {
+            table,
+            filters: self.detail_filters.clone(),
+            sort_index: self.sort_index,
+            sort_desc: self.sort_desc,
+            page: self
+                .preview
+                .as_ref()
+                .map(|preview| preview.page)
+                .unwrap_or(0),
+            selected_row: self.preview_row_index,
+        })
+    }
+
+    async fn pop_detail_nav_stack(&mut self) -> Result<bool> {
+        let Some(entry) = self.detail_nav_stack.pop() else {
+            return Ok(false);
+        };
+        let table_name = entry.table.display_name();
+        self.open_detail_context(entry, DetailView::Table, false)
+            .await?;
+        self.status = format!("Returned to {table_name}.");
+        Ok(true)
+    }
+
     fn preview_page_forward(&mut self) {
         if let Some(preview) = &mut self.preview {
             preview.page += 1;
@@ -650,11 +827,15 @@ impl App {
         self.detail_filters.clear();
         self.detail_filter_index = 0;
         self.detail_filter_prompt = None;
+        self.detail_drill_actions = None;
+        self.detail_drill_index = 0;
+        self.detail_nav_stack.clear();
         self.relation_graph = None;
         self.graph_lane = GraphLane::Center;
         self.graph_index = 0;
         self.graph_center_scroll = 0;
         self.preview = None;
+        self.preview_row_index = 0;
         self.sort_index = 0;
         self.sort_desc = false;
 
@@ -705,11 +886,15 @@ impl App {
         self.detail_filters.clear();
         self.detail_filter_index = 0;
         self.detail_filter_prompt = None;
+        self.detail_drill_actions = None;
+        self.detail_drill_index = 0;
+        self.detail_nav_stack.clear();
         self.relation_graph = None;
         self.graph_lane = GraphLane::Center;
         self.graph_index = 0;
         self.graph_center_scroll = 0;
         self.preview = None;
+        self.preview_row_index = 0;
         Ok(())
     }
 
@@ -727,14 +912,44 @@ impl App {
     }
 
     async fn load_table_detail(&mut self, table: TableRef, detail_view: DetailView) -> Result<()> {
-        let detail = self.session().unwrap().load_detail(&table).await?;
-        self.sort_index = 0;
-        self.sort_desc = false;
+        self.open_detail_context(
+            DetailNavStackEntry {
+                table: table.clone(),
+                filters: Vec::new(),
+                sort_index: 0,
+                sort_desc: false,
+                page: 0,
+                selected_row: 0,
+            },
+            detail_view,
+            true,
+        )
+        .await?;
+        self.status = format!("Viewing {}.", table.display_name());
+        Ok(())
+    }
+
+    async fn open_detail_context(
+        &mut self,
+        context: DetailNavStackEntry,
+        detail_view: DetailView,
+        clear_drill_stack: bool,
+    ) -> Result<()> {
+        let detail = self.session().unwrap().load_detail(&context.table).await?;
+        self.sort_index = context
+            .sort_index
+            .min(detail.columns.len().saturating_sub(1));
+        self.sort_desc = context.sort_desc;
         self.detail = Some(detail);
         self.detail_view = detail_view;
-        self.detail_filters.clear();
-        self.detail_filter_index = 0;
+        self.detail_filters = context.filters;
+        self.detail_filter_index = self.detail_filters.len().saturating_sub(1);
         self.detail_filter_prompt = None;
+        self.detail_drill_actions = None;
+        self.detail_drill_index = 0;
+        if clear_drill_stack {
+            self.detail_nav_stack.clear();
+        }
         self.graph_lane = GraphLane::Center;
         self.graph_index = 0;
         self.graph_center_scroll = 0;
@@ -742,15 +957,15 @@ impl App {
         self.preview = Some(DataPreview {
             columns: Vec::new(),
             rows: Vec::new(),
-            page: 0,
+            page: context.page,
             has_more: false,
         });
+        self.preview_row_index = context.selected_row;
         self.reload_preview().await?;
         if detail_view == DetailView::Graph {
             self.reload_relation_graph().await?;
         }
         self.screen = Screen::Detail;
-        self.status = format!("Viewing {}.", table.display_name());
         Ok(())
     }
 
@@ -766,6 +981,9 @@ impl App {
             .load_preview(&table, &self.current_preview_request())
             .await?;
         self.preview = Some(preview);
+        self.clamp_preview_row_index();
+        self.detail_drill_actions = None;
+        self.detail_drill_index = 0;
         Ok(())
     }
 
@@ -818,7 +1036,9 @@ impl App {
     }
 
     fn is_input_mode_active(&self) -> bool {
-        self.table_search_mode || self.detail_filter_prompt.is_some()
+        self.table_search_mode
+            || self.detail_filter_prompt.is_some()
+            || self.detail_drill_actions.is_some()
     }
 
     fn render(&self, frame: &mut Frame) {
@@ -850,8 +1070,11 @@ impl App {
             Screen::Detail if self.detail_filter_prompt.is_some() => {
                 "Up/Down move | Enter confirm | Esc cancel"
             }
+            Screen::Detail if self.detail_drill_actions.is_some() => {
+                "Up/Down move | Enter open relation | Esc cancel"
+            }
             Screen::Detail => {
-                "f add filter | h/l pick filter | x remove | c clear | [ ] sort | s order | n/p page | g graph | Esc back | q quit"
+                "Up/Down row | Enter relations | f add filter | h/l pick filter | x remove | c clear | [ ] sort | s order | n/p page | g graph | Esc back | q quit"
             }
         }
     }
@@ -1096,9 +1319,14 @@ impl App {
             self.detail_filters.len(),
         );
         let preview_widget = render_preview(preview, &detail.columns, preview_title);
-        frame.render_widget(preview_widget, body[2]);
+        let mut preview_state = TableState::default();
+        preview_state.select(self.selected_preview_row());
+        frame.render_stateful_widget(preview_widget, body[2], &mut preview_state);
         if let Some(prompt) = &self.detail_filter_prompt {
             self.render_detail_filter_prompt(frame, chunks[0], detail, prompt);
+        }
+        if let Some(actions) = &self.detail_drill_actions {
+            self.render_detail_drill_prompt(frame, chunks[0], actions);
         }
         frame.render_widget(status_bar(&self.status, self.controls_hint()), chunks[1]);
     }
@@ -1172,6 +1400,47 @@ impl App {
                 frame.render_widget(widget, popup);
             }
         }
+    }
+
+    fn render_detail_drill_prompt(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        actions: &[DrillThroughAction],
+    ) {
+        let popup = centered_rect(70, 12, area);
+        frame.render_widget(Clear, popup);
+
+        let items = actions
+            .iter()
+            .map(|action| {
+                let text = if let Some(reason) = &action.unavailable_reason {
+                    format!("{} [{}]", action.label(), reason)
+                } else {
+                    action.label()
+                };
+                if action.is_available() {
+                    ListItem::new(text)
+                } else {
+                    ListItem::new(Line::styled(
+                        text,
+                        Style::default().add_modifier(Modifier::DIM),
+                    ))
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut state = ListState::default();
+        state.select(Some(
+            self.detail_drill_index.min(actions.len().saturating_sub(1)),
+        ));
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .title("Row Relations")
+                    .borders(Borders::ALL),
+            )
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        frame.render_stateful_widget(list, popup, &mut state);
     }
 
     fn move_connection(&mut self, delta: isize) {
@@ -1909,7 +2178,7 @@ fn render_preview<'a>(
         .map(|preview| preview.rows.clone())
         .unwrap_or_default()
         .into_iter()
-        .map(Row::new);
+        .map(|row| Row::new(row.display_values()));
     let widths = columns
         .iter()
         .map(|_| Constraint::Length(18))
@@ -1918,6 +2187,7 @@ fn render_preview<'a>(
     Table::new(rows, widths)
         .header(header)
         .block(Block::default().title(title).borders(Borders::ALL))
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
 }
 
 #[cfg(test)]
@@ -1962,11 +2232,15 @@ mod tests {
             detail_filters: Vec::new(),
             detail_filter_index: 0,
             detail_filter_prompt: None,
+            detail_drill_actions: None,
+            detail_drill_index: 0,
+            detail_nav_stack: Vec::new(),
             relation_graph: None,
             graph_lane: GraphLane::Center,
             graph_index: 0,
             graph_center_scroll: 0,
             preview: None,
+            preview_row_index: 0,
             sort_index: 0,
             sort_desc: false,
             status: String::new(),
@@ -2084,6 +2358,44 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>()
+    }
+
+    fn preview_cell(raw: Option<&str>) -> crate::db::PreviewCell {
+        crate::db::PreviewCell {
+            display_value: raw.unwrap_or("NULL").into(),
+            raw_value: raw.map(|value| value.into()),
+        }
+    }
+
+    fn sample_preview() -> DataPreview {
+        DataPreview {
+            columns: vec![
+                "id".into(),
+                "project_id".into(),
+                "owner_id".into(),
+                "title".into(),
+            ],
+            rows: vec![
+                crate::db::PreviewRow {
+                    cells: vec![
+                        preview_cell(Some("1")),
+                        preview_cell(Some("10")),
+                        preview_cell(None),
+                        preview_cell(Some("Render relationship panel")),
+                    ],
+                },
+                crate::db::PreviewRow {
+                    cells: vec![
+                        preview_cell(Some("2")),
+                        preview_cell(Some("20")),
+                        preview_cell(Some("7")),
+                        preview_cell(Some("Add paging")),
+                    ],
+                },
+            ],
+            page: 0,
+            has_more: false,
+        }
     }
 
     #[test]
@@ -2373,6 +2685,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn up_down_moves_preview_row_selection() {
+        let mut app = test_app(Screen::Detail, false);
+        app.detail = Some(sample_graph_detail());
+        app.preview = Some(sample_preview());
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.preview_row_index, 1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.preview_row_index, 1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.preview_row_index, 0);
+    }
+
+    #[tokio::test]
+    async fn enter_opens_relation_picker_from_selected_row() {
+        let mut app = test_app(Screen::Detail, false);
+        app.detail = Some(sample_graph_detail());
+        app.preview = Some(sample_preview());
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            app.detail_drill_actions
+                .as_ref()
+                .map(|actions| actions.len()),
+            Some(2)
+        );
+        assert_eq!(app.detail_drill_index, 0);
+    }
+
+    #[tokio::test]
+    async fn disabled_relation_action_updates_status_without_navigation() {
+        let mut app = test_app(Screen::Detail, false);
+        app.detail = Some(TableDetail {
+            table: TableRef {
+                schema: None,
+                name: "tasks".into(),
+            },
+            columns: sample_graph_detail().columns,
+            foreign_keys: vec![ForeignKeyMeta {
+                from_column: "owner_id".into(),
+                to_table: TableRef {
+                    schema: None,
+                    name: "users".into(),
+                },
+                to_column: "id".into(),
+                direction: crate::db::RelationshipDirection::Outgoing,
+            }],
+            indexes: vec![],
+        });
+        app.preview = Some(sample_preview());
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert_eq!(app.detail.as_ref().unwrap().table.name, "tasks");
+        assert!(app.detail_drill_actions.is_some());
+        assert_eq!(app.detail_nav_stack.len(), 0);
+        assert_eq!(app.status, "Selected row has NULL in owner_id.");
+    }
+
+    #[tokio::test]
     async fn esc_returns_to_browser_from_detail() {
         let mut app = test_app(Screen::Detail, false);
 
@@ -2524,6 +2912,58 @@ mod tests {
         assert_eq!(app.graph_lane, GraphLane::Center);
         assert_eq!(app.graph_center_scroll, 1);
         assert_eq!(app.status, "Already centered on the current table.");
+    }
+
+    #[tokio::test]
+    async fn drill_through_and_escape_restore_parent_context_using_sample_db() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("sample")
+            .join("readgrid_demo.db");
+        let session = Session::connect(&ConnectionProfile {
+            name: "sample".into(),
+            kind: DatabaseKind::Sqlite,
+            url: None,
+            path: Some(path),
+        })
+        .await
+        .unwrap();
+
+        let mut app = test_app(Screen::Detail, false);
+        app.session = Some(session);
+        app.load_table_detail(
+            TableRef {
+                schema: None,
+                name: "tasks".into(),
+            },
+            DetailView::Table,
+        )
+        .await
+        .unwrap();
+        app.sort_index = 0;
+        app.sort_desc = false;
+        app.reload_preview().await.unwrap();
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert_eq!(app.detail.as_ref().unwrap().table.name, "projects");
+        assert_eq!(app.detail_nav_stack.len(), 1);
+        assert_eq!(app.detail_filters.len(), 1);
+        assert_eq!(app.detail_filters[0].column_name, "id");
+        assert_eq!(app.detail_filters[0].value.as_deref(), Some("1"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert_eq!(app.detail.as_ref().unwrap().table.name, "tasks");
+        assert_eq!(app.detail_nav_stack.len(), 0);
+        assert_eq!(app.preview_row_index, 0);
+        assert!(app.detail_filters.is_empty());
     }
 
     #[tokio::test]

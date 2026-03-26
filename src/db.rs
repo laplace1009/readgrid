@@ -85,7 +85,7 @@ pub struct ColumnMeta {
     pub is_primary_key: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelationshipDirection {
     Outgoing,
     Incoming,
@@ -100,7 +100,7 @@ impl RelationshipDirection {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForeignKeyMeta {
     pub from_column: String,
     pub to_table: TableRef,
@@ -211,12 +211,75 @@ pub struct PreviewRequest {
     pub page: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewCell {
+    pub display_value: String,
+    pub raw_value: Option<String>,
+}
+
+impl PreviewCell {
+    fn from_raw(raw_value: Option<String>) -> Self {
+        Self {
+            display_value: raw_value.clone().unwrap_or_else(|| "NULL".into()),
+            raw_value,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewRow {
+    pub cells: Vec<PreviewCell>,
+}
+
+impl PreviewRow {
+    pub fn display_values(&self) -> Vec<String> {
+        self.cells
+            .iter()
+            .map(|cell| cell.display_value.clone())
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DataPreview {
     pub columns: Vec<String>,
-    pub rows: Vec<Vec<String>>,
+    pub rows: Vec<PreviewRow>,
     pub page: usize,
     pub has_more: bool,
+}
+
+impl DataPreview {
+    pub fn cell(&self, row_index: usize, column_name: &str) -> Option<&PreviewCell> {
+        let column_index = self
+            .columns
+            .iter()
+            .position(|column| column == column_name)?;
+        self.rows.get(row_index)?.cells.get(column_index)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrillThroughAction {
+    pub relation: ForeignKeyMeta,
+    pub target_table: TableRef,
+    pub target_filter: Option<PreviewFilter>,
+    pub unavailable_reason: Option<String>,
+}
+
+impl DrillThroughAction {
+    pub fn label(&self) -> String {
+        format!(
+            "[{}] {}.{} <- {}",
+            self.relation.direction.label(),
+            self.target_table.display_name(),
+            self.relation.remote_column(),
+            self.relation.local_column(),
+        )
+    }
+
+    pub fn is_available(&self) -> bool {
+        self.target_filter.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -379,6 +442,82 @@ impl Session {
             Self::Postgres(pool) => load_postgres_relation_graph(pool, table).await,
             Self::Sqlite(pool) => load_sqlite_relation_graph(pool, table).await,
         }
+    }
+}
+
+pub fn build_drill_through_actions(
+    detail: &TableDetail,
+    preview: &DataPreview,
+    row_index: usize,
+) -> Vec<DrillThroughAction> {
+    let row_available = preview.rows.get(row_index).is_some();
+    let mut actions = detail
+        .foreign_keys
+        .iter()
+        .cloned()
+        .map(|relation| {
+            let (target_filter, unavailable_reason) = if !row_available {
+                (None, Some("No preview row is selected.".into()))
+            } else {
+                drill_through_filter_for_relation(preview, row_index, &relation)
+            };
+
+            DrillThroughAction {
+                target_table: relation.to_table.clone(),
+                relation,
+                target_filter,
+                unavailable_reason,
+            }
+        })
+        .collect::<Vec<_>>();
+    actions.sort_by_key(|action| {
+        (
+            drill_through_direction_rank(action.relation.direction),
+            action.target_table.display_name(),
+            action.relation.remote_column().to_string(),
+            action.relation.local_column().to_string(),
+        )
+    });
+    actions
+}
+
+fn drill_through_filter_for_relation(
+    preview: &DataPreview,
+    row_index: usize,
+    relation: &ForeignKeyMeta,
+) -> (Option<PreviewFilter>, Option<String>) {
+    match preview.cell(row_index, relation.local_column()) {
+        Some(cell) => match &cell.raw_value {
+            Some(value) => (
+                Some(PreviewFilter {
+                    column_name: relation.remote_column().to_string(),
+                    operator: FilterOperator::Equals,
+                    value: Some(value.clone()),
+                }),
+                None,
+            ),
+            None => (
+                None,
+                Some(format!(
+                    "Selected row has NULL in {}.",
+                    relation.local_column()
+                )),
+            ),
+        },
+        None => (
+            None,
+            Some(format!(
+                "Preview is missing column {}.",
+                relation.local_column()
+            )),
+        ),
+    }
+}
+
+fn drill_through_direction_rank(direction: RelationshipDirection) -> u8 {
+    match direction {
+        RelationshipDirection::Outgoing => 0,
+        RelationshipDirection::Incoming => 1,
     }
 }
 
@@ -964,16 +1103,12 @@ fn preview_from_pg_rows(
     let mut rendered_rows = Vec::new();
 
     for row in rows.into_iter().take(PAGE_SIZE) {
-        let mut values = Vec::new();
+        let mut cells = Vec::new();
         for index in 0..columns.len() {
-            let cell = row
-                .try_get::<Option<String>, _>(index)
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| "NULL".into());
-            values.push(cell);
+            let raw_value = row.try_get::<Option<String>, _>(index).ok().flatten();
+            cells.push(PreviewCell::from_raw(raw_value));
         }
-        rendered_rows.push(values);
+        rendered_rows.push(PreviewRow { cells });
     }
 
     Ok(DataPreview {
@@ -993,16 +1128,12 @@ fn preview_from_sqlite_rows(
     let mut rendered_rows = Vec::new();
 
     for row in rows.into_iter().take(PAGE_SIZE) {
-        let mut values = Vec::new();
+        let mut cells = Vec::new();
         for index in 0..columns.len() {
-            let cell = row
-                .try_get::<Option<String>, _>(index)
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| "NULL".into());
-            values.push(cell);
+            let raw_value = row.try_get::<Option<String>, _>(index).ok().flatten();
+            cells.push(PreviewCell::from_raw(raw_value));
         }
-        rendered_rows.push(values);
+        rendered_rows.push(PreviewRow { cells });
     }
 
     Ok(DataPreview {
@@ -1191,6 +1322,91 @@ mod tests {
         assert!(err.to_string().contains("unknown filter column 'missing'"));
     }
 
+    #[test]
+    fn preview_cell_from_raw_preserves_null_state() {
+        let missing = PreviewCell::from_raw(None);
+        let present = PreviewCell::from_raw(Some("literal".into()));
+
+        assert_eq!(missing.display_value, "NULL");
+        assert_eq!(missing.raw_value, None);
+        assert_eq!(present.display_value, "literal");
+        assert_eq!(present.raw_value.as_deref(), Some("literal"));
+    }
+
+    #[test]
+    fn drill_through_actions_cover_outgoing_incoming_and_null_values() {
+        let detail = TableDetail {
+            table: sample_table("tasks"),
+            columns: vec![],
+            foreign_keys: vec![
+                ForeignKeyMeta {
+                    from_column: "project_id".into(),
+                    to_table: sample_table("projects"),
+                    to_column: "id".into(),
+                    direction: RelationshipDirection::Outgoing,
+                },
+                ForeignKeyMeta {
+                    from_column: "assignee_id".into(),
+                    to_table: sample_table("users"),
+                    to_column: "id".into(),
+                    direction: RelationshipDirection::Outgoing,
+                },
+                ForeignKeyMeta {
+                    from_column: "task_id".into(),
+                    to_table: sample_table("comments"),
+                    to_column: "id".into(),
+                    direction: RelationshipDirection::Incoming,
+                },
+            ],
+            indexes: vec![],
+        };
+        let preview = DataPreview {
+            columns: vec!["id".into(), "project_id".into(), "assignee_id".into()],
+            rows: vec![PreviewRow {
+                cells: vec![
+                    PreviewCell::from_raw(Some("7".into())),
+                    PreviewCell::from_raw(Some("3".into())),
+                    PreviewCell::from_raw(None),
+                ],
+            }],
+            page: 0,
+            has_more: false,
+        };
+
+        let actions = build_drill_through_actions(&detail, &preview, 0);
+        let projects = actions
+            .iter()
+            .find(|action| action.target_table.name == "projects")
+            .unwrap();
+        let comments = actions
+            .iter()
+            .find(|action| action.target_table.name == "comments")
+            .unwrap();
+        let users = actions
+            .iter()
+            .find(|action| action.target_table.name == "users")
+            .unwrap();
+
+        assert_eq!(projects.target_filter.as_ref().unwrap().column_name, "id");
+        assert_eq!(
+            projects.target_filter.as_ref().unwrap().value.as_deref(),
+            Some("3")
+        );
+        assert_eq!(
+            comments.target_filter.as_ref().unwrap().column_name,
+            "task_id"
+        );
+        assert_eq!(
+            comments.target_filter.as_ref().unwrap().value.as_deref(),
+            Some("7")
+        );
+        assert!(!users.is_available());
+        assert_eq!(
+            users.unavailable_reason.as_deref(),
+            Some("Selected row has NULL in assignee_id.")
+        );
+    }
+
     #[tokio::test]
     async fn sqlite_filtered_preview_uses_sample_schema() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1236,18 +1452,18 @@ mod tests {
 
         assert_eq!(todo_preview.rows.len(), 2);
         assert_eq!(
-            todo_preview.rows[0][title_index],
+            todo_preview.rows[0].cells[title_index].display_value,
             "Add sample data preview paging"
         );
         assert_eq!(
-            todo_preview.rows[1][title_index],
+            todo_preview.rows[1].cells[title_index].display_value,
             "Render relationship panel"
         );
         assert!(
             todo_preview
                 .rows
                 .iter()
-                .all(|row| row[status_index] == "todo")
+                .all(|row| row.cells[status_index].display_value == "todo")
         );
 
         let null_preview = session
@@ -1272,7 +1488,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(null_preview.rows.len(), 1);
-        assert_eq!(null_preview.rows[0][assignee_index], "NULL");
+        assert_eq!(
+            null_preview.rows[0].cells[assignee_index].display_value,
+            "NULL"
+        );
+        assert_eq!(null_preview.rows[0].cells[assignee_index].raw_value, None);
     }
 
     #[tokio::test]
