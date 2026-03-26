@@ -1,4 +1,8 @@
-use std::{fmt, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    path::PathBuf,
+};
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -57,7 +61,7 @@ impl ConnectionProfile {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableRef {
     pub schema: Option<String>,
     pub name: String,
@@ -99,9 +103,25 @@ impl RelationshipDirection {
 #[derive(Debug, Clone)]
 pub struct ForeignKeyMeta {
     pub from_column: String,
-    pub to_table: String,
+    pub to_table: TableRef,
     pub to_column: String,
     pub direction: RelationshipDirection,
+}
+
+impl ForeignKeyMeta {
+    pub fn local_column(&self) -> &str {
+        match self.direction {
+            RelationshipDirection::Outgoing => &self.from_column,
+            RelationshipDirection::Incoming => &self.to_column,
+        }
+    }
+
+    pub fn remote_column(&self) -> &str {
+        match self.direction {
+            RelationshipDirection::Outgoing => &self.to_column,
+            RelationshipDirection::Incoming => &self.from_column,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +151,42 @@ pub struct DataPreview {
     pub rows: Vec<Vec<String>>,
     pub page: usize,
     pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RelationNodeRole {
+    Incoming,
+    Center,
+    Outgoing,
+}
+
+#[derive(Debug, Clone)]
+pub struct RelationNode {
+    pub table: TableRef,
+    pub key_columns: Vec<String>,
+    pub role: RelationNodeRole,
+}
+
+#[derive(Debug, Clone)]
+pub struct RelationEdge {
+    pub source_table: TableRef,
+    pub source_column: String,
+    pub target_table: TableRef,
+    pub target_column: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RelationGraph {
+    pub center: TableRef,
+    pub nodes: Vec<RelationNode>,
+    pub edges: Vec<RelationEdge>,
+}
+
+#[derive(Debug, Clone)]
+struct RelationNodeSpec {
+    table: TableRef,
+    related_columns: Vec<String>,
+    role: RelationNodeRole,
 }
 
 pub enum Session {
@@ -240,14 +296,21 @@ impl Session {
             Self::Sqlite(pool) => load_sqlite_preview(pool, table, sort, page).await,
         }
     }
+
+    pub async fn load_relation_graph(&self, table: &TableRef) -> Result<RelationGraph> {
+        match self {
+            Self::Postgres(pool) => load_postgres_relation_graph(pool, table).await,
+            Self::Sqlite(pool) => load_sqlite_relation_graph(pool, table).await,
+        }
+    }
 }
 
-async fn load_postgres_detail(pool: &PgPool, table: &TableRef) -> Result<TableDetail> {
+async fn load_postgres_columns(pool: &PgPool, table: &TableRef) -> Result<Vec<ColumnMeta>> {
     let schema = table
         .schema
         .as_deref()
         .context("postgres detail requires schema")?;
-    let columns = sqlx::query(
+    Ok(sqlx::query(
         "SELECT c.column_name, c.data_type, c.is_nullable, c.column_default,
                 EXISTS (
                     SELECT 1
@@ -276,7 +339,17 @@ async fn load_postgres_detail(pool: &PgPool, table: &TableRef) -> Result<TableDe
         default_value: row.try_get("column_default").ok(),
         is_primary_key: row.get("is_primary_key"),
     })
-    .collect();
+    .collect())
+}
+
+async fn load_postgres_foreign_keys(
+    pool: &PgPool,
+    table: &TableRef,
+) -> Result<Vec<ForeignKeyMeta>> {
+    let schema = table
+        .schema
+        .as_deref()
+        .context("postgres detail requires schema")?;
 
     let outgoing = sqlx::query(
         "SELECT kcu.column_name AS from_column,
@@ -323,24 +396,32 @@ async fn load_postgres_detail(pool: &PgPool, table: &TableRef) -> Result<TableDe
     let mut foreign_keys = Vec::new();
     foreign_keys.extend(outgoing.into_iter().map(|row| ForeignKeyMeta {
         from_column: row.get("from_column"),
-        to_table: format!(
-            "{}.{}",
-            row.get::<String, _>("target_schema"),
-            row.get::<String, _>("target_table")
-        ),
+        to_table: TableRef {
+            schema: Some(row.get("target_schema")),
+            name: row.get("target_table"),
+        },
         to_column: row.get("target_column"),
         direction: RelationshipDirection::Outgoing,
     }));
     foreign_keys.extend(incoming.into_iter().map(|row| ForeignKeyMeta {
         from_column: row.get("source_column"),
-        to_table: format!(
-            "{}.{}",
-            row.get::<String, _>("source_schema"),
-            row.get::<String, _>("source_table")
-        ),
+        to_table: TableRef {
+            schema: Some(row.get("source_schema")),
+            name: row.get("source_table"),
+        },
         to_column: row.get("target_column"),
         direction: RelationshipDirection::Incoming,
     }));
+    Ok(foreign_keys)
+}
+
+async fn load_postgres_detail(pool: &PgPool, table: &TableRef) -> Result<TableDetail> {
+    let schema = table
+        .schema
+        .as_deref()
+        .context("postgres detail requires schema")?;
+    let columns = load_postgres_columns(pool, table).await?;
+    let foreign_keys = load_postgres_foreign_keys(pool, table).await?;
 
     let indexes = sqlx::query(
         "SELECT indexname, indexdef FROM pg_indexes
@@ -370,20 +451,27 @@ async fn load_postgres_detail(pool: &PgPool, table: &TableRef) -> Result<TableDe
     })
 }
 
-async fn load_sqlite_detail(pool: &SqlitePool, table: &TableRef) -> Result<TableDetail> {
-    let columns = sqlx::query(&format!("PRAGMA table_info({})", quote_ident(&table.name)))
-        .fetch_all(pool)
-        .await?
-        .into_iter()
-        .map(|row| ColumnMeta {
-            name: row.get("name"),
-            data_type: row.get("type"),
-            nullable: row.get::<i64, _>("notnull") == 0,
-            default_value: row.try_get("dflt_value").ok(),
-            is_primary_key: row.get::<i64, _>("pk") > 0,
-        })
-        .collect::<Vec<_>>();
+async fn load_sqlite_columns(pool: &SqlitePool, table: &TableRef) -> Result<Vec<ColumnMeta>> {
+    Ok(
+        sqlx::query(&format!("PRAGMA table_info({})", quote_ident(&table.name)))
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .map(|row| ColumnMeta {
+                name: row.get("name"),
+                data_type: row.get("type"),
+                nullable: row.get::<i64, _>("notnull") == 0,
+                default_value: row.try_get("dflt_value").ok(),
+                is_primary_key: row.get::<i64, _>("pk") > 0,
+            })
+            .collect::<Vec<_>>(),
+    )
+}
 
+async fn load_sqlite_foreign_keys(
+    pool: &SqlitePool,
+    table: &TableRef,
+) -> Result<Vec<ForeignKeyMeta>> {
     let outgoing = sqlx::query(&format!(
         "PRAGMA foreign_key_list({})",
         quote_ident(&table.name)
@@ -401,7 +489,10 @@ async fn load_sqlite_detail(pool: &SqlitePool, table: &TableRef) -> Result<Table
     let mut foreign_keys = Vec::new();
     foreign_keys.extend(outgoing.into_iter().map(|row| ForeignKeyMeta {
         from_column: row.get("from"),
-        to_table: row.get("table"),
+        to_table: TableRef {
+            schema: None,
+            name: row.get("table"),
+        },
         to_column: row.get("to"),
         direction: RelationshipDirection::Outgoing,
     }));
@@ -420,13 +511,23 @@ async fn load_sqlite_detail(pool: &SqlitePool, table: &TableRef) -> Result<Table
             if target_table == table.name {
                 foreign_keys.push(ForeignKeyMeta {
                     from_column: edge.get("from"),
-                    to_table: other_name.clone(),
+                    to_table: TableRef {
+                        schema: None,
+                        name: other_name.clone(),
+                    },
                     to_column: edge.get("to"),
                     direction: RelationshipDirection::Incoming,
                 });
             }
         }
     }
+
+    Ok(foreign_keys)
+}
+
+async fn load_sqlite_detail(pool: &SqlitePool, table: &TableRef) -> Result<TableDetail> {
+    let columns = load_sqlite_columns(pool, table).await?;
+    let foreign_keys = load_sqlite_foreign_keys(pool, table).await?;
 
     let index_list = sqlx::query(&format!("PRAGMA index_list({})", quote_ident(&table.name)))
         .fetch_all(pool)
@@ -457,6 +558,137 @@ async fn load_sqlite_detail(pool: &SqlitePool, table: &TableRef) -> Result<Table
         foreign_keys,
         indexes,
     })
+}
+
+async fn load_postgres_relation_graph(pool: &PgPool, table: &TableRef) -> Result<RelationGraph> {
+    let detail = load_postgres_detail(pool, table).await?;
+    let specs = relation_node_specs(&detail);
+    let mut nodes = Vec::new();
+
+    for spec in specs {
+        let columns = if spec.role == RelationNodeRole::Center {
+            detail.columns.clone()
+        } else {
+            load_postgres_columns(pool, &spec.table).await?
+        };
+        nodes.push(RelationNode {
+            table: spec.table,
+            key_columns: collect_key_columns(&columns, &spec.related_columns),
+            role: spec.role,
+        });
+    }
+
+    sort_relation_nodes(&mut nodes);
+    Ok(RelationGraph {
+        center: detail.table.clone(),
+        nodes,
+        edges: relation_edges(&detail),
+    })
+}
+
+async fn load_sqlite_relation_graph(pool: &SqlitePool, table: &TableRef) -> Result<RelationGraph> {
+    let detail = load_sqlite_detail(pool, table).await?;
+    let specs = relation_node_specs(&detail);
+    let mut nodes = Vec::new();
+
+    for spec in specs {
+        let columns = if spec.role == RelationNodeRole::Center {
+            detail.columns.clone()
+        } else {
+            load_sqlite_columns(pool, &spec.table).await?
+        };
+        nodes.push(RelationNode {
+            table: spec.table,
+            key_columns: collect_key_columns(&columns, &spec.related_columns),
+            role: spec.role,
+        });
+    }
+
+    sort_relation_nodes(&mut nodes);
+    Ok(RelationGraph {
+        center: detail.table.clone(),
+        nodes,
+        edges: relation_edges(&detail),
+    })
+}
+
+fn relation_node_specs(detail: &TableDetail) -> Vec<RelationNodeSpec> {
+    let mut center_columns = Vec::new();
+    let mut grouped = HashMap::<(RelationNodeRole, TableRef), Vec<String>>::new();
+
+    for edge in &detail.foreign_keys {
+        center_columns.push(edge.local_column().to_string());
+        let role = match edge.direction {
+            RelationshipDirection::Incoming => RelationNodeRole::Incoming,
+            RelationshipDirection::Outgoing => RelationNodeRole::Outgoing,
+        };
+        grouped
+            .entry((role, edge.to_table.clone()))
+            .or_default()
+            .push(edge.remote_column().to_string());
+    }
+
+    let mut specs = vec![RelationNodeSpec {
+        table: detail.table.clone(),
+        related_columns: center_columns,
+        role: RelationNodeRole::Center,
+    }];
+
+    for ((role, table), related_columns) in grouped {
+        specs.push(RelationNodeSpec {
+            table,
+            related_columns,
+            role,
+        });
+    }
+
+    specs
+}
+
+fn relation_edges(detail: &TableDetail) -> Vec<RelationEdge> {
+    detail
+        .foreign_keys
+        .iter()
+        .map(|edge| match edge.direction {
+            RelationshipDirection::Outgoing => RelationEdge {
+                source_table: detail.table.clone(),
+                source_column: edge.from_column.clone(),
+                target_table: edge.to_table.clone(),
+                target_column: edge.to_column.clone(),
+            },
+            RelationshipDirection::Incoming => RelationEdge {
+                source_table: edge.to_table.clone(),
+                source_column: edge.from_column.clone(),
+                target_table: detail.table.clone(),
+                target_column: edge.to_column.clone(),
+            },
+        })
+        .collect()
+}
+
+fn collect_key_columns(columns: &[ColumnMeta], related_columns: &[String]) -> Vec<String> {
+    let related = related_columns.iter().cloned().collect::<HashSet<_>>();
+    let mut rendered = Vec::new();
+
+    for column in columns {
+        if column.is_primary_key || related.contains(&column.name) {
+            rendered.push(column.name.clone());
+        }
+    }
+
+    rendered
+}
+
+fn sort_relation_nodes(nodes: &mut [RelationNode]) {
+    nodes.sort_by_key(|node| (relation_role_rank(node.role), node.table.display_name()));
+}
+
+fn relation_role_rank(role: RelationNodeRole) -> u8 {
+    match role {
+        RelationNodeRole::Incoming => 0,
+        RelationNodeRole::Center => 1,
+        RelationNodeRole::Outgoing => 2,
+    }
 }
 
 async fn load_postgres_preview(
@@ -530,16 +762,12 @@ async fn sqlite_column_names(pool: &SqlitePool, table: &TableRef) -> Result<Vec<
     Ok(rows.into_iter().map(|row| row.get("name")).collect())
 }
 
-fn casted_select_list(columns: &[String], postgres: bool) -> String {
+fn casted_select_list(columns: &[String], _postgres: bool) -> String {
     columns
         .iter()
         .map(|name| {
             let ident = quote_ident(name);
-            if postgres {
-                format!("CAST({ident} AS TEXT) AS {ident}")
-            } else {
-                format!("CAST({ident} AS TEXT) AS {ident}")
-            }
+            format!("CAST({ident} AS TEXT) AS {ident}")
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -616,4 +844,161 @@ fn preview_from_sqlite_rows(
 
 fn quote_ident(input: &str) -> String {
     format!("\"{}\"", input.replace('"', "\"\""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_table(name: &str) -> TableRef {
+        TableRef {
+            schema: None,
+            name: name.into(),
+        }
+    }
+
+    #[test]
+    fn collect_key_columns_keeps_source_order_and_dedupes() {
+        let columns = vec![
+            ColumnMeta {
+                name: "id".into(),
+                data_type: "INTEGER".into(),
+                nullable: false,
+                default_value: None,
+                is_primary_key: true,
+            },
+            ColumnMeta {
+                name: "owner_id".into(),
+                data_type: "INTEGER".into(),
+                nullable: false,
+                default_value: None,
+                is_primary_key: false,
+            },
+            ColumnMeta {
+                name: "name".into(),
+                data_type: "TEXT".into(),
+                nullable: false,
+                default_value: None,
+                is_primary_key: false,
+            },
+        ];
+
+        let key_columns = collect_key_columns(
+            &columns,
+            &["owner_id".into(), "owner_id".into(), "missing".into()],
+        );
+
+        assert_eq!(key_columns, vec!["id", "owner_id"]);
+    }
+
+    #[test]
+    fn relation_node_specs_group_neighbors_by_role() {
+        let detail = TableDetail {
+            table: sample_table("tasks"),
+            columns: vec![],
+            foreign_keys: vec![
+                ForeignKeyMeta {
+                    from_column: "project_id".into(),
+                    to_table: sample_table("projects"),
+                    to_column: "id".into(),
+                    direction: RelationshipDirection::Outgoing,
+                },
+                ForeignKeyMeta {
+                    from_column: "project_id_backup".into(),
+                    to_table: sample_table("projects"),
+                    to_column: "id".into(),
+                    direction: RelationshipDirection::Outgoing,
+                },
+                ForeignKeyMeta {
+                    from_column: "task_id".into(),
+                    to_table: sample_table("comments"),
+                    to_column: "id".into(),
+                    direction: RelationshipDirection::Incoming,
+                },
+            ],
+            indexes: vec![],
+        };
+
+        let specs = relation_node_specs(&detail);
+        let outgoing = specs
+            .iter()
+            .find(|spec| spec.role == RelationNodeRole::Outgoing)
+            .unwrap();
+        let incoming = specs
+            .iter()
+            .find(|spec| spec.role == RelationNodeRole::Incoming)
+            .unwrap();
+        let center = specs
+            .iter()
+            .find(|spec| spec.role == RelationNodeRole::Center)
+            .unwrap();
+
+        assert_eq!(outgoing.table.name, "projects");
+        assert_eq!(outgoing.related_columns, vec!["id", "id"]);
+        assert_eq!(incoming.table.name, "comments");
+        assert_eq!(incoming.related_columns, vec!["task_id"]);
+        assert_eq!(
+            center.related_columns,
+            vec!["project_id", "project_id_backup", "id"]
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_relation_graph_uses_sample_schema() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("sample")
+            .join("readgrid_demo.db");
+        let session = Session::connect(&ConnectionProfile {
+            name: "sample".into(),
+            kind: DatabaseKind::Sqlite,
+            url: None,
+            path: Some(path),
+        })
+        .await
+        .unwrap();
+
+        let graph = session
+            .load_relation_graph(&sample_table("tasks"))
+            .await
+            .unwrap();
+
+        assert_eq!(graph.center.name, "tasks");
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.role == RelationNodeRole::Center
+                    && node.key_columns == vec!["id", "project_id", "assignee_id"])
+        );
+        assert!(
+            graph.nodes.iter().any(
+                |node| node.role == RelationNodeRole::Incoming && node.table.name == "comments"
+            )
+        );
+        assert!(
+            graph.nodes.iter().any(
+                |node| node.role == RelationNodeRole::Outgoing && node.table.name == "projects"
+            )
+        );
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.role == RelationNodeRole::Outgoing && node.table.name == "users")
+        );
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|edge| edge.source_table.name == "tasks"
+                    && edge.target_table.name == "projects")
+        );
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|edge| edge.source_table.name == "comments"
+                    && edge.target_table.name == "tasks")
+        );
+    }
 }

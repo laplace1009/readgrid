@@ -15,8 +15,8 @@ use ratatui::{
 use crate::{
     config::ConfigStore,
     db::{
-        ConnectionProfile, DataPreview, DatabaseKind, ForeignKeyMeta, Session, SortState,
-        TableDetail, TableRef,
+        ConnectionProfile, DataPreview, DatabaseKind, ForeignKeyMeta, RelationGraph, RelationNode,
+        RelationNodeRole, Session, SortState, TableDetail, TableRef,
     },
     mcp::McpContext,
 };
@@ -44,6 +44,19 @@ enum Screen {
     Detail,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailView {
+    Table,
+    Graph,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphLane {
+    Incoming,
+    Center,
+    Outgoing,
+}
+
 #[derive(Debug, Clone)]
 struct ConnectionCandidate {
     profile: ConnectionProfile,
@@ -66,6 +79,10 @@ pub struct App {
     active_profile: Option<ConnectionProfile>,
     active_schema: Option<String>,
     detail: Option<TableDetail>,
+    detail_view: DetailView,
+    relation_graph: Option<RelationGraph>,
+    graph_lane: GraphLane,
+    graph_index: usize,
     preview: Option<DataPreview>,
     sort_index: usize,
     sort_desc: bool,
@@ -109,6 +126,10 @@ impl App {
             active_profile: None,
             active_schema: None,
             detail: None,
+            detail_view: DetailView::Table,
+            relation_graph: None,
+            graph_lane: GraphLane::Center,
+            graph_index: 0,
             preview: None,
             sort_index: 0,
             sort_desc: false,
@@ -223,10 +244,17 @@ impl App {
     }
 
     async fn handle_detail_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.detail_view == DetailView::Graph {
+            return self.handle_graph_key(key).await;
+        }
+
         match key.code {
             KeyCode::Esc => {
                 self.screen = Screen::Browser;
                 self.status = "Returned to table browser.".into();
+            }
+            KeyCode::Char('g') => {
+                self.enter_graph_view().await?;
             }
             KeyCode::Char('[') => {
                 if self.sort_index > 0 {
@@ -274,7 +302,34 @@ impl App {
                 }
             }
             KeyCode::Char('r') => {
-                self.load_selected_table_detail().await?;
+                if let Some(table) = self.detail.as_ref().map(|detail| detail.table.clone()) {
+                    self.load_table_detail(table, DetailView::Table).await?;
+                }
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    async fn handle_graph_key(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('g') => {
+                self.detail_view = DetailView::Table;
+                self.status = "Returned to table detail.".into();
+            }
+            KeyCode::Left | KeyCode::Char('h') => self.move_graph_lane(-1),
+            KeyCode::Right | KeyCode::Char('l') => self.move_graph_lane(1),
+            KeyCode::Up | KeyCode::Char('k') => self.move_graph_row(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_graph_row(1),
+            KeyCode::Char('r') => {
+                self.reload_relation_graph().await?;
+                self.status = "Reloaded relationship graph.".into();
+            }
+            KeyCode::Enter => {
+                if let Some(table) = self.focused_graph_table() {
+                    self.load_table_detail(table, DetailView::Graph).await?;
+                    self.status = "Centered relationship graph on selected table.".into();
+                }
             }
             _ => {}
         }
@@ -317,6 +372,10 @@ impl App {
         self.active_profile = Some(candidate.profile.clone());
         self.session = Some(session);
         self.detail = None;
+        self.detail_view = DetailView::Table;
+        self.relation_graph = None;
+        self.graph_lane = GraphLane::Center;
+        self.graph_index = 0;
         self.preview = None;
         self.sort_index = 0;
         self.sort_desc = false;
@@ -364,6 +423,10 @@ impl App {
         self.filter.clear();
         self.search_mode = false;
         self.detail = None;
+        self.detail_view = DetailView::Table;
+        self.relation_graph = None;
+        self.graph_lane = GraphLane::Center;
+        self.graph_index = 0;
         self.preview = None;
         Ok(())
     }
@@ -378,11 +441,18 @@ impl App {
         let table = self
             .selected_table()
             .ok_or_else(|| anyhow!("no table is selected"))?;
+        self.load_table_detail(table, DetailView::Table).await
+    }
 
+    async fn load_table_detail(&mut self, table: TableRef, detail_view: DetailView) -> Result<()> {
         let detail = self.session().unwrap().load_detail(&table).await?;
         self.sort_index = 0;
         self.sort_desc = false;
         self.detail = Some(detail);
+        self.detail_view = detail_view;
+        self.graph_lane = GraphLane::Center;
+        self.graph_index = 0;
+        self.relation_graph = None;
         self.preview = Some(DataPreview {
             columns: Vec::new(),
             rows: Vec::new(),
@@ -390,6 +460,9 @@ impl App {
             has_more: false,
         });
         self.reload_preview().await?;
+        if detail_view == DetailView::Graph {
+            self.reload_relation_graph().await?;
+        }
         self.screen = Screen::Detail;
         self.status = format!("Viewing {}.", table.display_name());
         Ok(())
@@ -412,6 +485,31 @@ impl App {
             .load_preview(&table, self.current_sort().as_ref(), page)
             .await?;
         self.preview = Some(preview);
+        Ok(())
+    }
+
+    async fn reload_relation_graph(&mut self) -> Result<()> {
+        let table = self
+            .detail
+            .as_ref()
+            .map(|detail| detail.table.clone())
+            .ok_or_else(|| anyhow!("no table detail is loaded"))?;
+        let graph = self.session().unwrap().load_relation_graph(&table).await?;
+        self.relation_graph = Some(graph);
+        self.graph_lane = GraphLane::Center;
+        self.graph_index = 0;
+        Ok(())
+    }
+
+    async fn enter_graph_view(&mut self) -> Result<()> {
+        self.detail_view = DetailView::Graph;
+        if self.relation_graph.is_none() {
+            self.reload_relation_graph().await?;
+        } else {
+            self.graph_lane = GraphLane::Center;
+            self.graph_index = 0;
+        }
+        self.status = "Viewing relationship graph.".into();
         Ok(())
     }
 
@@ -439,7 +537,12 @@ impl App {
             Screen::Schemas => "Enter open schema | Esc back | q quit",
             Screen::Browser if self.search_mode => "Type filter | Enter apply | Esc clear",
             Screen::Browser => "Enter detail | / filter | r reload | Esc back | q quit",
-            Screen::Detail => "[ ] sort | s order | n/p page | r reload | Esc back | q quit",
+            Screen::Detail if self.detail_view == DetailView::Graph => {
+                "Arrows move | Enter center | g/Esc detail | r reload | q quit"
+            }
+            Screen::Detail => {
+                "g graph | [ ] sort | s order | n/p page | r reload | Esc back | q quit"
+            }
         }
     }
 
@@ -575,15 +678,6 @@ impl App {
 
     fn render_detail(&self, frame: &mut Frame) {
         let chunks = main_chunks(frame.area());
-        let body = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(42),
-                Constraint::Percentage(22),
-                Constraint::Percentage(36),
-            ])
-            .split(chunks[0]);
-
         let detail = match &self.detail {
             Some(detail) => detail,
             None => {
@@ -594,6 +688,21 @@ impl App {
                 return;
             }
         };
+
+        if self.detail_view == DetailView::Graph {
+            self.render_graph_detail(frame, chunks[0], detail);
+            frame.render_widget(status_bar(&self.status, self.controls_hint()), chunks[1]);
+            return;
+        }
+
+        let body = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(42),
+                Constraint::Percentage(22),
+                Constraint::Percentage(36),
+            ])
+            .split(chunks[0]);
 
         let header = Row::new(vec!["Column", "Type", "Null", "PK", "Default"])
             .style(Style::default().add_modifier(Modifier::BOLD));
@@ -722,9 +831,280 @@ impl App {
         self.session.as_ref().map(|session| session.kind())
     }
 
+    fn graph_lane_nodes(&self, lane: GraphLane) -> Vec<&RelationNode> {
+        self.relation_graph
+            .as_ref()
+            .map(|graph| {
+                graph
+                    .nodes
+                    .iter()
+                    .filter(|node| match lane {
+                        GraphLane::Incoming => node.role == RelationNodeRole::Incoming,
+                        GraphLane::Center => node.role == RelationNodeRole::Center,
+                        GraphLane::Outgoing => node.role == RelationNodeRole::Outgoing,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn graph_lane_len(&self, lane: GraphLane) -> usize {
+        self.graph_lane_nodes(lane).len()
+    }
+
+    fn move_graph_row(&mut self, delta: isize) {
+        self.graph_index = move_index(
+            self.graph_index,
+            self.graph_lane_len(self.graph_lane),
+            delta,
+        );
+    }
+
+    fn move_graph_lane(&mut self, delta: isize) {
+        let lanes = [GraphLane::Incoming, GraphLane::Center, GraphLane::Outgoing];
+        let Some(current) = lanes.iter().position(|lane| *lane == self.graph_lane) else {
+            return;
+        };
+        let mut next = current as isize + delta;
+
+        while next >= 0 && next < lanes.len() as isize {
+            let lane = lanes[next as usize];
+            if self.graph_lane_len(lane) > 0 {
+                self.graph_lane = lane;
+                self.graph_index = self
+                    .graph_index
+                    .min(self.graph_lane_len(lane).saturating_sub(1));
+                return;
+            }
+            next += delta;
+        }
+    }
+
+    fn focused_graph_table(&self) -> Option<TableRef> {
+        self.graph_lane_nodes(self.graph_lane)
+            .get(self.graph_index)
+            .map(|node| node.table.clone())
+    }
+
+    fn render_graph_detail(&self, frame: &mut Frame, area: Rect, detail: &TableDetail) {
+        let Some(graph) = &self.relation_graph else {
+            let loading = Paragraph::new("Loading relationship graph...").block(
+                Block::default()
+                    .title("Relation Graph")
+                    .borders(Borders::ALL),
+            );
+            frame.render_widget(loading, area);
+            return;
+        };
+
+        if area.width < 100 || area.height < 20 {
+            let fallback = Paragraph::new(graph_fallback_lines(graph))
+                .block(
+                    Block::default()
+                        .title(format!("Relation Graph: {}", detail.table.display_name()))
+                        .borders(Borders::ALL),
+                )
+                .wrap(Wrap { trim: false });
+            frame.render_widget(fallback, area);
+            return;
+        }
+
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(10), Constraint::Length(7)])
+            .split(area);
+        let lanes = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(33),
+                Constraint::Percentage(34),
+                Constraint::Percentage(33),
+            ])
+            .split(sections[0]);
+
+        let incoming = graph_node_lines(
+            "Incoming",
+            self.graph_lane_nodes(GraphLane::Incoming),
+            self.graph_lane == GraphLane::Incoming,
+            self.graph_index,
+        );
+        let center = graph_node_lines(
+            "Center",
+            self.graph_lane_nodes(GraphLane::Center),
+            self.graph_lane == GraphLane::Center,
+            self.graph_index,
+        );
+        let outgoing = graph_node_lines(
+            "Outgoing",
+            self.graph_lane_nodes(GraphLane::Outgoing),
+            self.graph_lane == GraphLane::Outgoing,
+            self.graph_index,
+        );
+
+        frame.render_widget(
+            Paragraph::new(incoming)
+                .block(Block::default().title("Incoming").borders(Borders::ALL))
+                .wrap(Wrap { trim: false }),
+            lanes[0],
+        );
+        frame.render_widget(
+            Paragraph::new(center)
+                .block(Block::default().title("Center").borders(Borders::ALL))
+                .wrap(Wrap { trim: false }),
+            lanes[1],
+        );
+        frame.render_widget(
+            Paragraph::new(outgoing)
+                .block(Block::default().title("Outgoing").borders(Borders::ALL))
+                .wrap(Wrap { trim: false }),
+            lanes[2],
+        );
+
+        frame.render_widget(
+            Paragraph::new(graph_edge_lines(graph))
+                .block(Block::default().title("Connections").borders(Borders::ALL))
+                .wrap(Wrap { trim: false }),
+            sections[1],
+        );
+    }
+
     fn find_selected_schema_hint(&self) -> Option<String> {
         None
     }
+}
+
+fn graph_node_lines<'a>(
+    lane_title: &'a str,
+    nodes: Vec<&'a RelationNode>,
+    lane_focused: bool,
+    focus_index: usize,
+) -> Vec<Line<'a>> {
+    if nodes.is_empty() {
+        return vec![Line::from(format!(
+            "No {} tables.",
+            lane_title.to_lowercase()
+        ))];
+    }
+
+    let mut lines = Vec::new();
+    for (index, node) in nodes.iter().enumerate() {
+        if index > 0 {
+            lines.push(Line::from(String::new()));
+        }
+        let focused = lane_focused && index == focus_index;
+        lines.extend(render_graph_node(node, focused));
+    }
+    lines
+}
+
+fn render_graph_node<'a>(node: &'a RelationNode, focused: bool) -> Vec<Line<'a>> {
+    let style = if focused {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default()
+    };
+    let mut lines = vec![
+        Line::styled("+--------------------------+", style),
+        Line::styled(
+            format!(
+                "| {:<24} |",
+                truncate_for_box(&node.table.display_name(), 24)
+            ),
+            style,
+        ),
+    ];
+
+    if node.key_columns.is_empty() {
+        lines.push(Line::styled("| (no key columns)         |", style));
+    } else {
+        for column in &node.key_columns {
+            lines.push(Line::styled(
+                format!("| {:<24} |", truncate_for_box(column, 24)),
+                style,
+            ));
+        }
+    }
+
+    lines.push(Line::styled("+--------------------------+", style));
+    lines
+}
+
+fn truncate_for_box(input: &str, width: usize) -> String {
+    let mut rendered = input.chars().take(width).collect::<String>();
+    let len = rendered.chars().count();
+    if len < width {
+        rendered.push_str(&" ".repeat(width - len));
+    }
+    rendered
+}
+
+fn graph_edge_lines(graph: &RelationGraph) -> Vec<Line<'static>> {
+    if graph.edges.is_empty() {
+        return vec![Line::from("No direct relationships for this table.")];
+    }
+
+    graph
+        .edges
+        .iter()
+        .map(|edge| {
+            if edge.source_table == graph.center && edge.target_table == graph.center {
+                Line::from(format!(
+                    "self: {} -> {}",
+                    edge.source_column, edge.target_column
+                ))
+            } else if edge.source_table == graph.center {
+                Line::from(format!(
+                    "out: {} -> {}.{}",
+                    edge.source_column,
+                    edge.target_table.display_name(),
+                    edge.target_column
+                ))
+            } else {
+                Line::from(format!(
+                    "in: {}.{} -> {}",
+                    edge.source_table.display_name(),
+                    edge.source_column,
+                    edge.target_column
+                ))
+            }
+        })
+        .collect()
+}
+
+fn graph_fallback_lines(graph: &RelationGraph) -> Vec<Line<'static>> {
+    let incoming = graph
+        .nodes
+        .iter()
+        .filter(|node| node.role == RelationNodeRole::Incoming)
+        .map(|node| node.table.display_name())
+        .collect::<Vec<_>>();
+    let outgoing = graph
+        .nodes
+        .iter()
+        .filter(|node| node.role == RelationNodeRole::Outgoing)
+        .map(|node| node.table.display_name())
+        .collect::<Vec<_>>();
+
+    vec![
+        Line::from("Terminal too small for the full graph view."),
+        Line::from(format!("Center: {}", graph.center.display_name())),
+        Line::from(format!(
+            "Incoming: {}",
+            if incoming.is_empty() {
+                "none".into()
+            } else {
+                incoming.join(", ")
+            }
+        )),
+        Line::from(format!(
+            "Outgoing: {}",
+            if outgoing.is_empty() {
+                "none".into()
+            } else {
+                outgoing.join(", ")
+            }
+        )),
+    ]
 }
 
 fn build_candidates(
@@ -849,7 +1229,7 @@ fn format_relationships(edges: &[ForeignKeyMeta]) -> String {
                 "[{}] {} -> {}.{}",
                 edge.direction.label(),
                 edge.from_column,
-                edge.to_table,
+                edge.to_table.display_name(),
                 edge.to_column
             )
         })
@@ -926,12 +1306,60 @@ mod tests {
             active_profile: None,
             active_schema: None,
             detail: None,
+            detail_view: DetailView::Table,
+            relation_graph: None,
+            graph_lane: GraphLane::Center,
+            graph_index: 0,
             preview: None,
             sort_index: 0,
             sort_desc: false,
             status: String::new(),
             example_config: String::new(),
             pending_auto_connect: false,
+        }
+    }
+
+    fn sample_relation_graph() -> RelationGraph {
+        RelationGraph {
+            center: TableRef {
+                schema: None,
+                name: "tasks".into(),
+            },
+            nodes: vec![
+                RelationNode {
+                    table: TableRef {
+                        schema: None,
+                        name: "comments".into(),
+                    },
+                    key_columns: vec!["id".into(), "task_id".into()],
+                    role: RelationNodeRole::Incoming,
+                },
+                RelationNode {
+                    table: TableRef {
+                        schema: None,
+                        name: "tasks".into(),
+                    },
+                    key_columns: vec!["id".into(), "project_id".into()],
+                    role: RelationNodeRole::Center,
+                },
+                RelationNode {
+                    table: TableRef {
+                        schema: None,
+                        name: "projects".into(),
+                    },
+                    key_columns: vec!["id".into()],
+                    role: RelationNodeRole::Outgoing,
+                },
+                RelationNode {
+                    table: TableRef {
+                        schema: None,
+                        name: "users".into(),
+                    },
+                    key_columns: vec!["id".into()],
+                    role: RelationNodeRole::Outgoing,
+                },
+            ],
+            edges: vec![],
         }
     }
 
@@ -1012,5 +1440,141 @@ mod tests {
 
         assert!(!should_quit);
         assert_eq!(app.screen, Screen::Browser);
+    }
+
+    #[tokio::test]
+    async fn g_toggles_to_graph_when_graph_is_cached() {
+        let mut app = test_app(Screen::Detail, false);
+        app.detail = Some(TableDetail {
+            table: TableRef {
+                schema: None,
+                name: "tasks".into(),
+            },
+            columns: vec![],
+            foreign_keys: vec![],
+            indexes: vec![],
+        });
+        app.relation_graph = Some(sample_relation_graph());
+
+        let should_quit = app
+            .handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(!should_quit);
+        assert_eq!(app.detail_view, DetailView::Graph);
+        assert_eq!(app.graph_lane, GraphLane::Center);
+    }
+
+    #[tokio::test]
+    async fn esc_returns_to_table_mode_from_graph() {
+        let mut app = test_app(Screen::Detail, false);
+        app.detail = Some(TableDetail {
+            table: TableRef {
+                schema: None,
+                name: "tasks".into(),
+            },
+            columns: vec![],
+            foreign_keys: vec![],
+            indexes: vec![],
+        });
+        app.detail_view = DetailView::Graph;
+        app.relation_graph = Some(sample_relation_graph());
+
+        let should_quit = app
+            .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(!should_quit);
+        assert_eq!(app.screen, Screen::Detail);
+        assert_eq!(app.detail_view, DetailView::Table);
+    }
+
+    #[tokio::test]
+    async fn graph_navigation_moves_focus_between_lanes() {
+        let mut app = test_app(Screen::Detail, false);
+        app.detail = Some(TableDetail {
+            table: TableRef {
+                schema: None,
+                name: "tasks".into(),
+            },
+            columns: vec![],
+            foreign_keys: vec![],
+            indexes: vec![],
+        });
+        app.detail_view = DetailView::Graph;
+        app.relation_graph = Some(sample_relation_graph());
+
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.graph_lane, GraphLane::Incoming);
+        assert_eq!(app.focused_graph_table().unwrap().name, "comments");
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.graph_lane, GraphLane::Outgoing);
+        assert_eq!(app.focused_graph_table().unwrap().name, "projects");
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.focused_graph_table().unwrap().name, "users");
+    }
+
+    #[tokio::test]
+    async fn enter_recenters_graph_using_sample_db() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("sample")
+            .join("readgrid_demo.db");
+        let session = Session::connect(&ConnectionProfile {
+            name: "sample".into(),
+            kind: DatabaseKind::Sqlite,
+            url: None,
+            path: Some(path),
+        })
+        .await
+        .unwrap();
+
+        let mut app = test_app(Screen::Detail, false);
+        app.session = Some(session);
+        app.detail = Some(
+            app.session()
+                .unwrap()
+                .load_detail(&TableRef {
+                    schema: None,
+                    name: "tasks".into(),
+                })
+                .await
+                .unwrap(),
+        );
+        app.relation_graph = Some(
+            app.session()
+                .unwrap()
+                .load_relation_graph(&TableRef {
+                    schema: None,
+                    name: "tasks".into(),
+                })
+                .await
+                .unwrap(),
+        );
+        app.detail_view = DetailView::Graph;
+        app.graph_lane = GraphLane::Outgoing;
+        app.graph_index = 0;
+
+        let should_quit = app
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(!should_quit);
+        assert_eq!(app.detail_view, DetailView::Graph);
+        assert_eq!(app.detail.as_ref().unwrap().table.name, "projects");
+        assert_eq!(app.relation_graph.as_ref().unwrap().center.name, "projects");
     }
 }
