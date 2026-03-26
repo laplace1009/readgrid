@@ -259,6 +259,14 @@ impl DataPreview {
 }
 
 pub fn write_preview_csv(preview: &DataPreview, path: &Path) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    }
+
     let file = std::fs::File::create(path)
         .with_context(|| format!("failed to create {}", path.display()))?;
     let mut writer = csv::Writer::from_writer(file);
@@ -1469,6 +1477,34 @@ mod tests {
             vec!["id", "title", "notes"]
         );
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn write_preview_csv_creates_missing_parent_directories() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "readgrid_db_nested_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        let path = dir.join("exports").join("preview.csv");
+        let preview = sample_csv_preview(vec![vec![Some("1"), Some("alpha"), None]]);
+
+        write_preview_csv(&preview, &path).unwrap();
+
+        assert!(path.exists());
+        let mut reader = csv::Reader::from_path(&path).unwrap();
+        let rows = reader
+            .records()
+            .map(|row| row.unwrap().iter().map(str::to_string).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][2], "NULL");
     }
 
     #[test]

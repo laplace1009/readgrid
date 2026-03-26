@@ -463,10 +463,23 @@ impl App {
             return;
         }
 
+        let default_path = self.default_export_path();
         self.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
-            value: String::new(),
+            value: default_path.display().to_string(),
         });
-        self.status = "Type a CSV path and press Enter.".into();
+        self.status = "Press Enter to export or edit the CSV path.".into();
+    }
+
+    fn default_export_path(&self) -> PathBuf {
+        let file_name = self
+            .detail
+            .as_ref()
+            .map(|detail| match &detail.table.schema {
+                Some(schema) => format!("{}_{}.csv", schema, detail.table.name),
+                None => format!("{}.csv", detail.table.name),
+            })
+            .unwrap_or_else(|| "preview.csv".into());
+        PathBuf::from("db_csv").join(file_name)
     }
 
     fn handle_detail_export_prompt_key(&mut self, key: KeyEvent) {
@@ -1469,6 +1482,7 @@ impl App {
         let widget = match prompt {
             DetailExportPrompt::EnterPath { value } => Paragraph::new(vec![
                 Line::from("Export the visible preview page as CSV."),
+                Line::from("Edit the path or press Enter to export."),
                 Line::from(""),
                 Line::from(format!("Path: {value}")),
             ])
@@ -2574,14 +2588,6 @@ mod tests {
         ))
     }
 
-    async fn type_text(app: &mut App, text: &str) {
-        for ch in text.chars() {
-            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
-                .await
-                .unwrap();
-        }
-    }
-
     #[test]
     fn graph_lane_title_marks_center_as_current() {
         assert_eq!(graph_lane_title(GraphLane::Center), "Center (current)");
@@ -2880,9 +2886,9 @@ mod tests {
 
         assert!(matches!(
             app.detail_export_prompt,
-            Some(DetailExportPrompt::EnterPath { ref value }) if value.is_empty()
+            Some(DetailExportPrompt::EnterPath { ref value }) if value == "db_csv/tasks.csv"
         ));
-        assert_eq!(app.status, "Type a CSV path and press Enter.");
+        assert_eq!(app.status, "Press Enter to export or edit the CSV path.");
     }
 
     #[tokio::test]
@@ -2911,9 +2917,16 @@ mod tests {
         let mut app = test_app(Screen::Detail, false);
         app.detail = Some(sample_graph_detail());
         app.preview = Some(sample_preview());
-        app.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
-            value: String::new(),
-        });
+        let default_value = app.default_export_path().display().to_string();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        for _ in 0..default_value.chars().count() {
+            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+                .await
+                .unwrap();
+        }
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .await
@@ -2968,11 +2981,10 @@ mod tests {
         app.preview = Some(sample_preview());
         let path = temp_csv_path("success");
         let value = path.display().to_string();
+        app.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+            value: value.clone(),
+        });
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
-            .await
-            .unwrap();
-        type_text(&mut app, &value).await;
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .await
             .unwrap();
@@ -3000,9 +3012,9 @@ mod tests {
         let mut app = test_app(Screen::Detail, false);
         app.detail = Some(sample_graph_detail());
         app.preview = Some(sample_preview());
-        let path = std::env::temp_dir()
-            .join("readgrid_missing_dir")
-            .join("export.csv");
+        let parent = temp_csv_path("failure_parent");
+        fs::write(&parent, "not a directory").unwrap();
+        let path = parent.join("export.csv");
         let value = path.display().to_string();
         app.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
             value: value.clone(),
@@ -3017,6 +3029,7 @@ mod tests {
             Some(DetailExportPrompt::EnterPath { value: ref prompt_value }) if prompt_value == &value
         ));
         assert!(app.status.starts_with("CSV export failed: "));
+        fs::remove_file(&parent).ok();
     }
 
     #[tokio::test]
