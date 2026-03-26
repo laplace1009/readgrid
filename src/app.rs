@@ -83,6 +83,7 @@ pub struct App {
     relation_graph: Option<RelationGraph>,
     graph_lane: GraphLane,
     graph_index: usize,
+    graph_center_scroll: usize,
     preview: Option<DataPreview>,
     sort_index: usize,
     sort_desc: bool,
@@ -130,6 +131,7 @@ impl App {
             relation_graph: None,
             graph_lane: GraphLane::Center,
             graph_index: 0,
+            graph_center_scroll: 0,
             preview: None,
             sort_index: 0,
             sort_desc: false,
@@ -326,7 +328,9 @@ impl App {
                 self.status = "Reloaded relationship graph.".into();
             }
             KeyCode::Enter => {
-                if let Some(table) = self.focused_graph_table() {
+                if self.graph_lane == GraphLane::Center {
+                    self.status = "Already centered on the current table.".into();
+                } else if let Some(table) = self.focused_graph_table() {
                     self.load_table_detail(table, DetailView::Graph).await?;
                     self.status = "Centered relationship graph on selected table.".into();
                 }
@@ -376,6 +380,7 @@ impl App {
         self.relation_graph = None;
         self.graph_lane = GraphLane::Center;
         self.graph_index = 0;
+        self.graph_center_scroll = 0;
         self.preview = None;
         self.sort_index = 0;
         self.sort_desc = false;
@@ -427,6 +432,7 @@ impl App {
         self.relation_graph = None;
         self.graph_lane = GraphLane::Center;
         self.graph_index = 0;
+        self.graph_center_scroll = 0;
         self.preview = None;
         Ok(())
     }
@@ -452,6 +458,7 @@ impl App {
         self.detail_view = detail_view;
         self.graph_lane = GraphLane::Center;
         self.graph_index = 0;
+        self.graph_center_scroll = 0;
         self.relation_graph = None;
         self.preview = Some(DataPreview {
             columns: Vec::new(),
@@ -498,6 +505,7 @@ impl App {
         self.relation_graph = Some(graph);
         self.graph_lane = GraphLane::Center;
         self.graph_index = 0;
+        self.graph_center_scroll = 0;
         Ok(())
     }
 
@@ -508,6 +516,7 @@ impl App {
         } else {
             self.graph_lane = GraphLane::Center;
             self.graph_index = 0;
+            self.graph_center_scroll = 0;
         }
         self.status = "Viewing relationship graph.".into();
         Ok(())
@@ -538,7 +547,7 @@ impl App {
             Screen::Browser if self.search_mode => "Type filter | Enter apply | Esc clear",
             Screen::Browser => "Enter detail | / filter | r reload | Esc back | q quit",
             Screen::Detail if self.detail_view == DetailView::Graph => {
-                "Arrows move | Enter center | g/Esc detail | r reload | q quit"
+                "Left/Right lane | Up/Down move-or-scroll | Enter center neighbor | g/Esc detail | r reload | q quit"
             }
             Screen::Detail => {
                 "g graph | [ ] sort | s order | n/p page | r reload | Esc back | q quit"
@@ -853,11 +862,20 @@ impl App {
     }
 
     fn move_graph_row(&mut self, delta: isize) {
-        self.graph_index = move_index(
-            self.graph_index,
-            self.graph_lane_len(self.graph_lane),
-            delta,
-        );
+        if self.graph_lane == GraphLane::Center {
+            let len = self
+                .detail
+                .as_ref()
+                .map(|detail| detail.columns.len())
+                .unwrap_or(0);
+            self.graph_center_scroll = move_index(self.graph_center_scroll, len, delta);
+        } else {
+            self.graph_index = move_index(
+                self.graph_index,
+                self.graph_lane_len(self.graph_lane),
+                delta,
+            );
+        }
     }
 
     fn move_graph_lane(&mut self, delta: isize) {
@@ -898,13 +916,19 @@ impl App {
         };
 
         if area.width < 100 || area.height < 20 {
-            let fallback = Paragraph::new(graph_fallback_lines(graph))
-                .block(
-                    Block::default()
-                        .title(format!("Relation Graph: {}", detail.table.display_name()))
-                        .borders(Borders::ALL),
-                )
-                .wrap(Wrap { trim: false });
+            let fallback = Paragraph::new(graph_fallback_lines(
+                graph,
+                detail,
+                self.graph_center_scroll,
+                area.width.saturating_sub(2) as usize,
+                area.height.saturating_sub(2) as usize,
+            ))
+            .block(
+                Block::default()
+                    .title(format!("Relation Graph: {}", detail.table.display_name()))
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: false });
             frame.render_widget(fallback, area);
             return;
         }
@@ -916,9 +940,9 @@ impl App {
         let lanes = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(33),
-                Constraint::Percentage(34),
-                Constraint::Percentage(33),
+                Constraint::Percentage(25),
+                Constraint::Percentage(50),
+                Constraint::Percentage(25),
             ])
             .split(sections[0]);
 
@@ -928,11 +952,11 @@ impl App {
             self.graph_lane == GraphLane::Incoming,
             self.graph_index,
         );
-        let center = graph_node_lines(
-            "Center",
-            self.graph_lane_nodes(GraphLane::Center),
-            self.graph_lane == GraphLane::Center,
-            self.graph_index,
+        let center = graph_center_lines(
+            detail,
+            self.graph_center_scroll,
+            lanes[1].width.saturating_sub(2) as usize,
+            lanes[1].height.saturating_sub(2) as usize,
         );
         let outgoing = graph_node_lines(
             "Outgoing",
@@ -945,7 +969,7 @@ impl App {
             Paragraph::new(incoming)
                 .block(
                     Block::default()
-                        .title("Incoming (-> center)")
+                        .title(graph_lane_title(GraphLane::Incoming))
                         .borders(Borders::ALL),
                 )
                 .wrap(Wrap { trim: false }),
@@ -953,7 +977,18 @@ impl App {
         );
         frame.render_widget(
             Paragraph::new(center)
-                .block(Block::default().title("Center").borders(Borders::ALL))
+                .block(
+                    Block::default()
+                        .title(graph_center_title(
+                            detail,
+                            self.graph_center_scroll,
+                            lanes[1].height.saturating_sub(2) as usize,
+                        ))
+                        .borders(Borders::ALL)
+                        .border_style(graph_center_border_style(
+                            self.graph_lane == GraphLane::Center,
+                        )),
+                )
                 .wrap(Wrap { trim: false }),
             lanes[1],
         );
@@ -961,7 +996,7 @@ impl App {
             Paragraph::new(outgoing)
                 .block(
                     Block::default()
-                        .title("Outgoing (center ->)")
+                        .title(graph_lane_title(GraphLane::Outgoing))
                         .borders(Borders::ALL),
                 )
                 .wrap(Wrap { trim: false }),
@@ -1011,6 +1046,7 @@ fn render_graph_node<'a>(node: &'a RelationNode, focused: bool) -> Vec<Line<'a>>
     } else {
         Style::default()
     };
+    let name_style = style.add_modifier(Modifier::BOLD);
     let mut lines = vec![
         Line::styled("+--------------------------+", style),
         Line::styled(
@@ -1018,8 +1054,9 @@ fn render_graph_node<'a>(node: &'a RelationNode, focused: bool) -> Vec<Line<'a>>
                 "| {:<24} |",
                 truncate_for_box(&node.table.display_name(), 24)
             ),
-            style,
+            name_style,
         ),
+        Line::styled("|--------------------------|", style),
     ];
 
     if node.key_columns.is_empty() {
@@ -1044,6 +1081,105 @@ fn truncate_for_box(input: &str, width: usize) -> String {
         rendered.push_str(&" ".repeat(width - len));
     }
     rendered
+}
+
+fn truncate_with_ellipsis(input: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+
+    let len = input.chars().count();
+    if len <= width {
+        return input.to_string();
+    }
+
+    if width <= 3 {
+        return input.chars().take(width).collect();
+    }
+
+    let mut rendered = input.chars().take(width - 3).collect::<String>();
+    rendered.push_str("...");
+    rendered
+}
+
+fn graph_center_lines(
+    detail: &TableDetail,
+    scroll: usize,
+    width: usize,
+    height: usize,
+) -> Vec<Line<'static>> {
+    if detail.columns.is_empty() {
+        return vec![Line::from("No columns found for the current table.")];
+    }
+
+    let visible_rows = height.max(1);
+    detail
+        .columns
+        .iter()
+        .skip(scroll)
+        .take(visible_rows)
+        .map(|column| graph_center_column_line(column, &detail.foreign_keys, width))
+        .collect()
+}
+
+fn graph_center_column_line(
+    column: &crate::db::ColumnMeta,
+    foreign_keys: &[ForeignKeyMeta],
+    width: usize,
+) -> Line<'static> {
+    let mut badges = Vec::new();
+    let has_incoming_fk = foreign_keys
+        .iter()
+        .any(|edge| edge.local_column() == column.name && edge.direction.label() == "in");
+    let has_outgoing_fk = foreign_keys
+        .iter()
+        .any(|edge| edge.local_column() == column.name && edge.direction.label() == "out");
+
+    if column.is_primary_key {
+        badges.push("[pk]");
+    }
+    if has_incoming_fk {
+        badges.push("[fk-in]");
+    }
+    if has_outgoing_fk {
+        badges.push("[fk-out]");
+    }
+    if column.nullable {
+        badges.push("[null]");
+    }
+
+    let mut rendered = format!("{} : {}", column.name, column.data_type);
+    if !badges.is_empty() {
+        rendered.push(' ');
+        rendered.push_str(&badges.join(" "));
+    }
+
+    Line::from(truncate_with_ellipsis(&rendered, width))
+}
+
+fn graph_center_title(detail: &TableDetail, scroll: usize, height: usize) -> String {
+    let total = detail.columns.len();
+    if total == 0 {
+        return format!("Center (current): {} [0/0]", detail.table.display_name());
+    }
+
+    let start = scroll.min(total.saturating_sub(1)) + 1;
+    let end = (scroll + height.max(1)).min(total);
+    format!(
+        "Center (current): {} [{}-{} / {}]",
+        detail.table.display_name(),
+        start,
+        end,
+        total
+    )
+}
+
+fn graph_center_border_style(focused: bool) -> Style {
+    if focused {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default()
+    }
 }
 
 fn graph_edge_lines(graph: &RelationGraph) -> Vec<Line<'static>> {
@@ -1079,7 +1215,13 @@ fn graph_edge_lines(graph: &RelationGraph) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn graph_fallback_lines(graph: &RelationGraph) -> Vec<Line<'static>> {
+fn graph_fallback_lines(
+    graph: &RelationGraph,
+    detail: &TableDetail,
+    scroll: usize,
+    width: usize,
+    height: usize,
+) -> Vec<Line<'static>> {
     let incoming = graph
         .nodes
         .iter()
@@ -1093,26 +1235,45 @@ fn graph_fallback_lines(graph: &RelationGraph) -> Vec<Line<'static>> {
         .map(|node| node.table.display_name())
         .collect::<Vec<_>>();
 
-    vec![
+    let mut lines = vec![
         Line::from("Terminal too small for the full graph view."),
-        Line::from(format!("Center: {}", graph.center.display_name())),
         Line::from(format!(
-            "Incoming: {}",
-            if incoming.is_empty() {
-                "none".into()
-            } else {
-                incoming.join(", ")
-            }
+            "{}: {}",
+            graph_lane_title(GraphLane::Center),
+            graph.center.display_name()
         )),
-        Line::from(format!(
-            "Outgoing: {}",
-            if outgoing.is_empty() {
-                "none".into()
-            } else {
-                outgoing.join(", ")
-            }
-        )),
-    ]
+        Line::from("Columns:"),
+    ];
+
+    let column_height = height.saturating_sub(5).max(1);
+    lines.extend(graph_center_lines(detail, scroll, width, column_height));
+    lines.push(Line::from(String::new()));
+    lines.push(Line::from(format!(
+        "Incoming: {}",
+        if incoming.is_empty() {
+            "none".into()
+        } else {
+            incoming.join(", ")
+        }
+    )));
+    lines.push(Line::from(format!(
+        "Outgoing: {}",
+        if outgoing.is_empty() {
+            "none".into()
+        } else {
+            outgoing.join(", ")
+        }
+    )));
+
+    lines
+}
+
+fn graph_lane_title(lane: GraphLane) -> &'static str {
+    match lane {
+        GraphLane::Incoming => "Incoming (-> center)",
+        GraphLane::Center => "Center (current)",
+        GraphLane::Outgoing => "Outgoing (center ->)",
+    }
 }
 
 fn build_candidates(
@@ -1318,6 +1479,7 @@ mod tests {
             relation_graph: None,
             graph_lane: GraphLane::Center,
             graph_index: 0,
+            graph_center_scroll: 0,
             preview: None,
             sort_index: 0,
             sort_desc: false,
@@ -1369,6 +1531,160 @@ mod tests {
             ],
             edges: vec![],
         }
+    }
+
+    fn sample_graph_detail() -> TableDetail {
+        TableDetail {
+            table: TableRef {
+                schema: None,
+                name: "tasks".into(),
+            },
+            columns: vec![
+                crate::db::ColumnMeta {
+                    name: "id".into(),
+                    data_type: "INTEGER".into(),
+                    nullable: false,
+                    default_value: None,
+                    is_primary_key: true,
+                },
+                crate::db::ColumnMeta {
+                    name: "project_id".into(),
+                    data_type: "INTEGER".into(),
+                    nullable: false,
+                    default_value: None,
+                    is_primary_key: false,
+                },
+                crate::db::ColumnMeta {
+                    name: "owner_id".into(),
+                    data_type: "INTEGER".into(),
+                    nullable: true,
+                    default_value: None,
+                    is_primary_key: false,
+                },
+                crate::db::ColumnMeta {
+                    name: "title".into(),
+                    data_type: "TEXT".into(),
+                    nullable: false,
+                    default_value: None,
+                    is_primary_key: false,
+                },
+            ],
+            foreign_keys: vec![
+                ForeignKeyMeta {
+                    from_column: "project_id".into(),
+                    to_table: TableRef {
+                        schema: None,
+                        name: "projects".into(),
+                    },
+                    to_column: "id".into(),
+                    direction: crate::db::RelationshipDirection::Outgoing,
+                },
+                ForeignKeyMeta {
+                    from_column: "tasks".into(),
+                    to_table: TableRef {
+                        schema: None,
+                        name: "comments".into(),
+                    },
+                    to_column: "owner_id".into(),
+                    direction: crate::db::RelationshipDirection::Incoming,
+                },
+            ],
+            indexes: vec![],
+        }
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn graph_lane_title_marks_center_as_current() {
+        assert_eq!(graph_lane_title(GraphLane::Center), "Center (current)");
+    }
+
+    #[test]
+    fn render_graph_node_uses_name_header_and_separator() {
+        let node = RelationNode {
+            table: TableRef {
+                schema: None,
+                name: "tasks".into(),
+            },
+            key_columns: vec!["id".into(), "project_id".into()],
+            role: RelationNodeRole::Center,
+        };
+
+        let lines = render_graph_node(&node, false);
+
+        assert_eq!(line_text(&lines[1]), "| tasks                    |");
+        assert_eq!(line_text(&lines[2]), "|--------------------------|");
+        assert_eq!(
+            lines[1].style,
+            Style::default().add_modifier(Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn render_graph_node_keeps_empty_state_below_name_header() {
+        let node = RelationNode {
+            table: TableRef {
+                schema: None,
+                name: "audit_log".into(),
+            },
+            key_columns: vec![],
+            role: RelationNodeRole::Outgoing,
+        };
+
+        let lines = render_graph_node(&node, false);
+
+        assert_eq!(line_text(&lines[2]), "|--------------------------|");
+        assert_eq!(line_text(&lines[3]), "| (no key columns)         |");
+    }
+
+    #[test]
+    fn render_graph_node_adds_bold_to_focused_name_row() {
+        let node = RelationNode {
+            table: TableRef {
+                schema: None,
+                name: "projects".into(),
+            },
+            key_columns: vec!["id".into()],
+            role: RelationNodeRole::Outgoing,
+        };
+
+        let lines = render_graph_node(&node, true);
+
+        assert_eq!(
+            lines[1].style,
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn graph_center_lines_show_type_and_relation_badges() {
+        let detail = sample_graph_detail();
+
+        let lines = graph_center_lines(&detail, 0, 80, 4);
+
+        assert_eq!(line_text(&lines[0]), "id : INTEGER [pk]");
+        assert_eq!(line_text(&lines[1]), "project_id : INTEGER [fk-out]");
+        assert_eq!(line_text(&lines[2]), "owner_id : INTEGER [fk-in] [null]");
+        assert_eq!(line_text(&lines[3]), "title : TEXT");
+    }
+
+    #[test]
+    fn graph_fallback_lines_include_center_column_detail() {
+        let graph = sample_relation_graph();
+        let detail = sample_graph_detail();
+
+        let lines = graph_fallback_lines(&graph, &detail, 0, 80, 12);
+        let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+
+        assert!(rendered.contains("Columns:"));
+        assert!(rendered.contains("project_id : INTEGER [fk-out]"));
+        assert!(rendered.contains("owner_id : INTEGER [fk-in] [null]"));
     }
 
     #[tokio::test]
@@ -1536,6 +1852,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn center_lane_uses_up_down_for_column_scrolling() {
+        let mut app = test_app(Screen::Detail, false);
+        app.detail = Some(sample_graph_detail());
+        app.detail_view = DetailView::Graph;
+        app.relation_graph = Some(sample_relation_graph());
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert_eq!(app.graph_lane, GraphLane::Center);
+        assert_eq!(app.graph_index, 0);
+        assert_eq!(app.graph_center_scroll, 2);
+
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.graph_center_scroll, 2);
+    }
+
+    #[tokio::test]
+    async fn enter_is_noop_when_center_lane_is_selected() {
+        let mut app = test_app(Screen::Detail, false);
+        app.detail = Some(sample_graph_detail());
+        app.detail_view = DetailView::Graph;
+        app.relation_graph = Some(sample_relation_graph());
+        app.graph_center_scroll = 1;
+
+        let should_quit = app
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(!should_quit);
+        assert_eq!(app.graph_lane, GraphLane::Center);
+        assert_eq!(app.graph_center_scroll, 1);
+        assert_eq!(app.status, "Already centered on the current table.");
+    }
+
+    #[tokio::test]
     async fn enter_recenters_graph_using_sample_db() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("sample")
@@ -1574,6 +1936,7 @@ mod tests {
         app.detail_view = DetailView::Graph;
         app.graph_lane = GraphLane::Outgoing;
         app.graph_index = 0;
+        app.graph_center_scroll = 3;
 
         let should_quit = app
             .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
@@ -1584,5 +1947,6 @@ mod tests {
         assert_eq!(app.detail_view, DetailView::Graph);
         assert_eq!(app.detail.as_ref().unwrap().table.name, "projects");
         assert_eq!(app.relation_graph.as_ref().unwrap().center.name, "projects");
+        assert_eq!(app.graph_center_scroll, 0);
     }
 }
