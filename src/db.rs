@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row, SqlitePool, postgres::PgRow, sqlite::SqliteRow};
 
 pub const PAGE_SIZE: usize = 50;
+const EXPORT_BATCH_SIZE: usize = 250;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -139,7 +140,7 @@ pub struct TableDetail {
     pub indexes: Vec<IndexMeta>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SortState {
     pub column_name: String,
     pub descending: bool,
@@ -204,11 +205,74 @@ impl PreviewFilter {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct PreviewRequest {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvestigationSource {
+    Table(TableRef),
+}
+
+impl InvestigationSource {
+    pub fn table(&self) -> &TableRef {
+        match self {
+            Self::Table(table) => table,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvestigationState {
+    pub source: InvestigationSource,
     pub sort: Option<SortState>,
     pub filters: Vec<PreviewFilter>,
     pub page: usize,
+}
+
+impl InvestigationState {
+    pub fn for_table(table: TableRef) -> Self {
+        Self {
+            source: InvestigationSource::Table(table),
+            sort: None,
+            filters: Vec::new(),
+            page: 0,
+        }
+    }
+
+    pub fn table(&self) -> &TableRef {
+        self.source.table()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportScope {
+    VisiblePage,
+    AllMatchingRows,
+}
+
+impl ExportScope {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::VisiblePage => "visible page",
+            Self::AllMatchingRows => "all matching rows",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportFormat {
+    Csv,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportRequest {
+    pub format: ExportFormat,
+    pub scope: ExportScope,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportSummary {
+    pub rows_written: usize,
+    pub scope: ExportScope,
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,7 +322,25 @@ impl DataPreview {
     }
 }
 
-pub fn write_preview_csv(preview: &DataPreview, path: &Path) -> Result<()> {
+pub fn write_preview_csv(preview: &DataPreview, path: &Path) -> Result<usize> {
+    let mut writer = create_csv_writer(path)?;
+    write_csv_header(&mut writer, &preview.columns, path)?;
+
+    let mut rows_written = 0;
+    for row in &preview.rows {
+        write_csv_record(
+            &mut writer,
+            row.cells.iter().map(|cell| cell.display_value.as_str()),
+            path,
+        )?;
+        rows_written += 1;
+    }
+
+    flush_csv_writer(&mut writer, path)?;
+    Ok(rows_written)
+}
+
+fn create_csv_writer(path: &Path) -> Result<csv::Writer<std::fs::File>> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -269,18 +351,32 @@ pub fn write_preview_csv(preview: &DataPreview, path: &Path) -> Result<()> {
 
     let file = std::fs::File::create(path)
         .with_context(|| format!("failed to create {}", path.display()))?;
-    let mut writer = csv::Writer::from_writer(file);
+    Ok(csv::Writer::from_writer(file))
+}
 
+fn write_csv_header(
+    writer: &mut csv::Writer<std::fs::File>,
+    columns: &[String],
+    path: &Path,
+) -> Result<()> {
     writer
-        .write_record(preview.columns.iter())
+        .write_record(columns.iter())
         .with_context(|| format!("failed to write CSV header to {}", path.display()))?;
+    Ok(())
+}
 
-    for row in &preview.rows {
-        writer
-            .write_record(row.cells.iter().map(|cell| cell.display_value.as_str()))
-            .with_context(|| format!("failed to write CSV row to {}", path.display()))?;
-    }
+fn write_csv_record<'a>(
+    writer: &mut csv::Writer<std::fs::File>,
+    row: impl IntoIterator<Item = &'a str>,
+    path: &Path,
+) -> Result<()> {
+    writer
+        .write_record(row)
+        .with_context(|| format!("failed to write CSV row to {}", path.display()))?;
+    Ok(())
+}
 
+fn flush_csv_writer(writer: &mut csv::Writer<std::fs::File>, path: &Path) -> Result<()> {
     writer
         .flush()
         .with_context(|| format!("failed to flush CSV writer for {}", path.display()))?;
@@ -357,6 +453,19 @@ enum PreviewDialect {
 struct FilterClause {
     sql: String,
     bindings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct QueryPlan {
+    columns: Vec<String>,
+    sql: String,
+    bindings: Vec<String>,
+}
+
+impl QueryPlan {
+    fn paged_sql(&self, limit: usize, offset: usize) -> String {
+        format!("{} LIMIT {} OFFSET {}", self.sql, limit, offset)
+    }
 }
 
 pub enum Session {
@@ -455,14 +564,25 @@ impl Session {
         }
     }
 
-    pub async fn load_preview(
-        &self,
-        table: &TableRef,
-        request: &PreviewRequest,
-    ) -> Result<DataPreview> {
+    pub async fn load_preview(&self, state: &InvestigationState) -> Result<DataPreview> {
         match self {
-            Self::Postgres(pool) => load_postgres_preview(pool, table, request).await,
-            Self::Sqlite(pool) => load_sqlite_preview(pool, table, request).await,
+            Self::Postgres(pool) => load_postgres_preview(pool, state).await,
+            Self::Sqlite(pool) => load_sqlite_preview(pool, state).await,
+        }
+    }
+
+    pub async fn export_csv(
+        &self,
+        state: &InvestigationState,
+        request: &ExportRequest,
+    ) -> Result<ExportSummary> {
+        if request.format != ExportFormat::Csv {
+            return Err(anyhow!("unsupported export format"));
+        }
+
+        match self {
+            Self::Postgres(pool) => export_postgres_csv(pool, state, request).await,
+            Self::Sqlite(pool) => export_sqlite_csv(pool, state, request).await,
         }
     }
 
@@ -936,61 +1056,273 @@ fn relation_role_rank(role: RelationNodeRole) -> u8 {
     }
 }
 
-async fn load_postgres_preview(
-    pool: &PgPool,
-    table: &TableRef,
-    request: &PreviewRequest,
-) -> Result<DataPreview> {
+async fn load_postgres_preview(pool: &PgPool, state: &InvestigationState) -> Result<DataPreview> {
+    let plan = build_postgres_query_plan(pool, state).await?;
+    let query = plan.paged_sql(PAGE_SIZE + 1, state.page * PAGE_SIZE);
+    let mut query = sqlx::query(&query);
+    for binding in plan.bindings {
+        query = query.bind(binding);
+    }
+    let rows = query.fetch_all(pool).await?;
+    preview_from_pg_rows(plan.columns, rows, state.page)
+}
+
+async fn load_sqlite_preview(pool: &SqlitePool, state: &InvestigationState) -> Result<DataPreview> {
+    let plan = build_sqlite_query_plan(pool, state).await?;
+    let query = plan.paged_sql(PAGE_SIZE + 1, state.page * PAGE_SIZE);
+    let mut query = sqlx::query(&query);
+    for binding in plan.bindings {
+        query = query.bind(binding);
+    }
+    let rows = query.fetch_all(pool).await?;
+    preview_from_sqlite_rows(plan.columns, rows, state.page)
+}
+
+async fn build_postgres_query_plan(pool: &PgPool, state: &InvestigationState) -> Result<QueryPlan> {
+    let table = state.table();
     let schema = table
         .schema
         .as_deref()
         .context("postgres preview requires schema")?;
     let columns = postgres_column_names(pool, table).await?;
     let select_list = casted_select_list(&columns);
-    let filters = build_filter_clause(&request.filters, &columns, PreviewDialect::Postgres)?;
-    let order_clause = build_order_clause(request.sort.as_ref());
-    let query = format!(
-        "SELECT {} FROM {}.{}{}{} LIMIT {} OFFSET {}",
-        select_list,
-        quote_ident(schema),
-        quote_ident(&table.name),
-        filters.sql,
-        order_clause,
-        PAGE_SIZE + 1,
-        request.page * PAGE_SIZE,
-    );
-    let mut query = sqlx::query(&query);
-    for binding in filters.bindings {
-        query = query.bind(binding);
-    }
-    let rows = query.fetch_all(pool).await?;
-    preview_from_pg_rows(columns, rows, request.page)
+    let filters = build_filter_clause(&state.filters, &columns, PreviewDialect::Postgres)?;
+    let order_clause = build_order_clause(state.sort.as_ref());
+    Ok(QueryPlan {
+        columns,
+        sql: format!(
+            "SELECT {} FROM {}.{}{}{}",
+            select_list,
+            quote_ident(schema),
+            quote_ident(&table.name),
+            filters.sql,
+            order_clause,
+        ),
+        bindings: filters.bindings,
+    })
 }
 
-async fn load_sqlite_preview(
+async fn build_sqlite_query_plan(
     pool: &SqlitePool,
-    table: &TableRef,
-    request: &PreviewRequest,
-) -> Result<DataPreview> {
+    state: &InvestigationState,
+) -> Result<QueryPlan> {
+    let table = state.table();
     let columns = sqlite_column_names(pool, table).await?;
     let select_list = casted_select_list(&columns);
-    let filters = build_filter_clause(&request.filters, &columns, PreviewDialect::Sqlite)?;
-    let order_clause = build_order_clause(request.sort.as_ref());
-    let query = format!(
-        "SELECT {} FROM {}{}{} LIMIT {} OFFSET {}",
-        select_list,
-        quote_ident(&table.name),
-        filters.sql,
-        order_clause,
-        PAGE_SIZE + 1,
-        request.page * PAGE_SIZE,
-    );
+    let filters = build_filter_clause(&state.filters, &columns, PreviewDialect::Sqlite)?;
+    let order_clause = build_order_clause(state.sort.as_ref());
+    Ok(QueryPlan {
+        columns,
+        sql: format!(
+            "SELECT {} FROM {}{}{}",
+            select_list,
+            quote_ident(&table.name),
+            filters.sql,
+            order_clause,
+        ),
+        bindings: filters.bindings,
+    })
+}
+
+async fn export_postgres_page(
+    pool: &PgPool,
+    plan: &QueryPlan,
+    page: usize,
+    page_size: usize,
+    writer: &mut csv::Writer<std::fs::File>,
+    path: &Path,
+) -> Result<usize> {
+    let query = plan.paged_sql(page_size, page * page_size);
     let mut query = sqlx::query(&query);
-    for binding in filters.bindings {
+    for binding in &plan.bindings {
         query = query.bind(binding);
     }
+
     let rows = query.fetch_all(pool).await?;
-    preview_from_sqlite_rows(columns, rows, request.page)
+    let mut rows_written = 0;
+    for row in rows {
+        rows_written += write_pg_row(writer, &row, plan.columns.len(), path)?;
+    }
+
+    Ok(rows_written)
+}
+
+async fn export_postgres_all_rows(
+    pool: &PgPool,
+    plan: &QueryPlan,
+    writer: &mut csv::Writer<std::fs::File>,
+    path: &Path,
+) -> Result<usize> {
+    let mut page = 0;
+    let mut rows_written = 0;
+
+    loop {
+        let written =
+            export_postgres_page(pool, plan, page, EXPORT_BATCH_SIZE, writer, path).await?;
+        rows_written += written;
+        if written < EXPORT_BATCH_SIZE {
+            break;
+        }
+        page += 1;
+    }
+
+    Ok(rows_written)
+}
+
+async fn export_sqlite_page(
+    pool: &SqlitePool,
+    plan: &QueryPlan,
+    page: usize,
+    page_size: usize,
+    writer: &mut csv::Writer<std::fs::File>,
+    path: &Path,
+) -> Result<usize> {
+    let query = plan.paged_sql(page_size, page * page_size);
+    let mut query = sqlx::query(&query);
+    for binding in &plan.bindings {
+        query = query.bind(binding);
+    }
+
+    let rows = query.fetch_all(pool).await?;
+    let mut rows_written = 0;
+    for row in rows {
+        rows_written += write_sqlite_row(writer, &row, plan.columns.len(), path)?;
+    }
+
+    Ok(rows_written)
+}
+
+async fn export_sqlite_all_rows(
+    pool: &SqlitePool,
+    plan: &QueryPlan,
+    writer: &mut csv::Writer<std::fs::File>,
+    path: &Path,
+) -> Result<usize> {
+    let mut page = 0;
+    let mut rows_written = 0;
+
+    loop {
+        let written = export_sqlite_page(pool, plan, page, EXPORT_BATCH_SIZE, writer, path).await?;
+        rows_written += written;
+        if written < EXPORT_BATCH_SIZE {
+            break;
+        }
+        page += 1;
+    }
+
+    Ok(rows_written)
+}
+
+fn write_pg_row(
+    writer: &mut csv::Writer<std::fs::File>,
+    row: &PgRow,
+    column_count: usize,
+    path: &Path,
+) -> Result<usize> {
+    let rendered = render_pg_row(row, column_count);
+    write_csv_record(writer, rendered.iter().map(String::as_str), path)?;
+    Ok(1)
+}
+
+fn write_sqlite_row(
+    writer: &mut csv::Writer<std::fs::File>,
+    row: &SqliteRow,
+    column_count: usize,
+    path: &Path,
+) -> Result<usize> {
+    let rendered = render_sqlite_row(row, column_count);
+    write_csv_record(writer, rendered.iter().map(String::as_str), path)?;
+    Ok(1)
+}
+
+fn render_pg_row(row: &PgRow, column_count: usize) -> Vec<String> {
+    (0..column_count)
+        .map(|index| {
+            row.try_get::<Option<String>, _>(index)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "NULL".into())
+        })
+        .collect()
+}
+
+fn render_sqlite_row(row: &SqliteRow, column_count: usize) -> Vec<String> {
+    (0..column_count)
+        .map(|index| {
+            row.try_get::<Option<String>, _>(index)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "NULL".into())
+        })
+        .collect()
+}
+
+async fn export_postgres_csv(
+    pool: &PgPool,
+    state: &InvestigationState,
+    request: &ExportRequest,
+) -> Result<ExportSummary> {
+    let plan = build_postgres_query_plan(pool, state).await?;
+    let mut writer = create_csv_writer(&request.path)?;
+    write_csv_header(&mut writer, &plan.columns, &request.path)?;
+
+    let rows_written = match request.scope {
+        ExportScope::VisiblePage => {
+            export_postgres_page(
+                pool,
+                &plan,
+                state.page,
+                PAGE_SIZE,
+                &mut writer,
+                &request.path,
+            )
+            .await?
+        }
+        ExportScope::AllMatchingRows => {
+            export_postgres_all_rows(pool, &plan, &mut writer, &request.path).await?
+        }
+    };
+
+    flush_csv_writer(&mut writer, &request.path)?;
+    Ok(ExportSummary {
+        rows_written,
+        scope: request.scope,
+        path: request.path.clone(),
+    })
+}
+
+async fn export_sqlite_csv(
+    pool: &SqlitePool,
+    state: &InvestigationState,
+    request: &ExportRequest,
+) -> Result<ExportSummary> {
+    let plan = build_sqlite_query_plan(pool, state).await?;
+    let mut writer = create_csv_writer(&request.path)?;
+    write_csv_header(&mut writer, &plan.columns, &request.path)?;
+
+    let rows_written = match request.scope {
+        ExportScope::VisiblePage => {
+            export_sqlite_page(
+                pool,
+                &plan,
+                state.page,
+                PAGE_SIZE,
+                &mut writer,
+                &request.path,
+            )
+            .await?
+        }
+        ExportScope::AllMatchingRows => {
+            export_sqlite_all_rows(pool, &plan, &mut writer, &request.path).await?
+        }
+    };
+
+    flush_csv_writer(&mut writer, &request.path)?;
+    Ok(ExportSummary {
+        rows_written,
+        scope: request.scope,
+        path: request.path.clone(),
+    })
 }
 
 async fn postgres_column_names(pool: &PgPool, table: &TableRef) -> Result<Vec<String>> {
@@ -1182,15 +1514,31 @@ mod tests {
     use std::{
         fs,
         path::PathBuf,
+        str::FromStr,
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use super::*;
+    use sqlx::{Executor, sqlite::SqliteConnectOptions};
 
     fn sample_table(name: &str) -> TableRef {
         TableRef {
             schema: None,
             name: name.into(),
+        }
+    }
+
+    fn sample_investigation(
+        table_name: &str,
+        sort: Option<SortState>,
+        filters: Vec<PreviewFilter>,
+        page: usize,
+    ) -> InvestigationState {
+        InvestigationState {
+            source: InvestigationSource::Table(sample_table(table_name)),
+            sort,
+            filters,
+            page,
         }
     }
 
@@ -1204,6 +1552,45 @@ mod tests {
             std::process::id(),
             unique
         ))
+    }
+
+    fn temp_sqlite_path(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "readgrid_{name}_{}_{}.db",
+            std::process::id(),
+            unique
+        ))
+    }
+
+    async fn large_sqlite_session(row_count: usize) -> (Session, PathBuf) {
+        let path = temp_sqlite_path("large_export");
+        let options = SqliteConnectOptions::from_str(path.to_str().unwrap())
+            .unwrap()
+            .create_if_missing(true);
+        let pool = SqlitePool::connect_with(options).await.unwrap();
+        pool.execute(
+            "CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL
+            )",
+        )
+        .await
+        .unwrap();
+        for id in 1..=row_count {
+            sqlx::query("INSERT INTO tasks (id, title, status) VALUES (?, ?, ?)")
+                .bind(id as i64)
+                .bind(format!("Task {id:03}"))
+                .bind(if id % 3 == 0 { "done" } else { "todo" })
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        (Session::Sqlite(pool), path)
     }
 
     fn sample_csv_preview(rows: Vec<Vec<Option<&str>>>) -> DataPreview {
@@ -1596,21 +1983,19 @@ mod tests {
         .unwrap();
 
         let todo_preview = session
-            .load_preview(
-                &sample_table("tasks"),
-                &PreviewRequest {
-                    sort: Some(SortState {
-                        column_name: "title".into(),
-                        descending: false,
-                    }),
-                    filters: vec![PreviewFilter {
-                        column_name: "status".into(),
-                        operator: FilterOperator::Equals,
-                        value: Some("todo".into()),
-                    }],
-                    page: 0,
-                },
-            )
+            .load_preview(&sample_investigation(
+                "tasks",
+                Some(SortState {
+                    column_name: "title".into(),
+                    descending: false,
+                }),
+                vec![PreviewFilter {
+                    column_name: "status".into(),
+                    operator: FilterOperator::Equals,
+                    value: Some("todo".into()),
+                }],
+                0,
+            ))
             .await
             .unwrap();
         let title_index = todo_preview
@@ -1641,18 +2026,16 @@ mod tests {
         );
 
         let null_preview = session
-            .load_preview(
-                &sample_table("tasks"),
-                &PreviewRequest {
-                    sort: None,
-                    filters: vec![PreviewFilter {
-                        column_name: "assignee_id".into(),
-                        operator: FilterOperator::IsNull,
-                        value: None,
-                    }],
-                    page: 0,
-                },
-            )
+            .load_preview(&sample_investigation(
+                "tasks",
+                None,
+                vec![PreviewFilter {
+                    column_name: "assignee_id".into(),
+                    operator: FilterOperator::IsNull,
+                    value: None,
+                }],
+                0,
+            ))
             .await
             .unwrap();
         let assignee_index = null_preview
@@ -1667,6 +2050,57 @@ mod tests {
             "NULL"
         );
         assert_eq!(null_preview.rows[0].cells[assignee_index].raw_value, None);
+    }
+
+    #[tokio::test]
+    async fn sqlite_full_export_writes_all_matching_rows_across_pages() {
+        let (session, db_path) = large_sqlite_session(PAGE_SIZE + 17).await;
+        let export_path = temp_csv_path("all_matching_rows");
+        let state = sample_investigation(
+            "tasks",
+            Some(SortState {
+                column_name: "title".into(),
+                descending: false,
+            }),
+            vec![PreviewFilter {
+                column_name: "status".into(),
+                operator: FilterOperator::Equals,
+                value: Some("todo".into()),
+            }],
+            1,
+        );
+
+        let summary = session
+            .export_csv(
+                &state,
+                &ExportRequest {
+                    format: ExportFormat::Csv,
+                    scope: ExportScope::AllMatchingRows,
+                    path: export_path.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut reader = csv::Reader::from_path(&export_path).unwrap();
+        let headers = reader.headers().unwrap().clone();
+        let rows = reader
+            .records()
+            .map(|row| row.unwrap().iter().map(str::to_string).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        fs::remove_file(&export_path).ok();
+        fs::remove_file(&db_path).ok();
+
+        assert_eq!(summary.scope, ExportScope::AllMatchingRows);
+        assert_eq!(summary.rows_written, 45);
+        assert_eq!(
+            headers.iter().collect::<Vec<_>>(),
+            vec!["id", "title", "status"]
+        );
+        assert_eq!(rows.len(), 45);
+        assert_eq!(rows.first().unwrap()[0], "1");
+        assert_eq!(rows.last().unwrap()[0], "67");
+        assert!(rows.iter().all(|row| row[2] == "todo"));
     }
 
     #[tokio::test]
