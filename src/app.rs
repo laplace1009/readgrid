@@ -22,8 +22,9 @@ use serde::Deserialize;
 use crate::{
     config::ConfigStore,
     db::{
-        ConnectionProfile, DataPreview, DatabaseKind, DrillThroughAction, FilterOperator,
-        ForeignKeyMeta, PreviewFilter, PreviewRequest, RelationGraph, RelationNode,
+        ConnectionProfile, DataPreview, DatabaseKind, DrillThroughAction, ExportFormat,
+        ExportRequest, ExportScope, ExportSummary, FilterOperator, ForeignKeyMeta,
+        InvestigationSource, InvestigationState, PreviewFilter, RelationGraph, RelationNode,
         RelationNodeRole, Session, SortState, TableDetail, TableRef, build_drill_through_actions,
         write_preview_csv,
     },
@@ -95,8 +96,16 @@ enum DetailFilterPrompt {
 
 #[derive(Debug, Clone)]
 enum DetailExportPrompt {
-    EnterPath { value: String },
-    ConfirmOverwrite { value: String },
+    EnterPath {
+        scope: ExportScope,
+        value: String,
+        edited: bool,
+    },
+    ConfirmOverwrite {
+        scope: ExportScope,
+        value: String,
+        edited: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,11 +135,7 @@ impl StartupTarget {
 
 #[derive(Debug, Clone)]
 struct DetailNavStackEntry {
-    table: TableRef,
-    filters: Vec<PreviewFilter>,
-    sort_index: usize,
-    sort_desc: bool,
-    page: usize,
+    investigation: InvestigationState,
     selected_row: usize,
 }
 
@@ -149,8 +154,8 @@ pub struct App {
     active_profile: Option<ConnectionProfile>,
     active_schema: Option<String>,
     detail: Option<TableDetail>,
+    active_investigation: Option<InvestigationState>,
     detail_view: DetailView,
-    detail_filters: Vec<PreviewFilter>,
     detail_filter_index: usize,
     detail_filter_prompt: Option<DetailFilterPrompt>,
     detail_export_prompt: Option<DetailExportPrompt>,
@@ -164,7 +169,6 @@ pub struct App {
     preview: Option<DataPreview>,
     preview_row_index: usize,
     sort_index: usize,
-    sort_desc: bool,
     status: String,
     example_config: String,
     pending_auto_connect: bool,
@@ -212,8 +216,8 @@ impl App {
             active_profile: None,
             active_schema: None,
             detail: None,
+            active_investigation: None,
             detail_view: DetailView::Table,
-            detail_filters: Vec::new(),
             detail_filter_index: 0,
             detail_filter_prompt: None,
             detail_export_prompt: None,
@@ -227,7 +231,6 @@ impl App {
             preview: None,
             preview_row_index: 0,
             sort_index: 0,
-            sort_desc: false,
             status,
             example_config,
             pending_auto_connect,
@@ -345,7 +348,7 @@ impl App {
         }
 
         if self.detail_export_prompt.is_some() {
-            self.handle_detail_export_prompt_key(key);
+            self.handle_detail_export_prompt_key(key).await?;
             return Ok(false);
         }
 
@@ -391,6 +394,7 @@ impl App {
             KeyCode::Char('[') => {
                 if self.sort_index > 0 {
                     self.sort_index -= 1;
+                    self.sync_sort_from_index()?;
                     self.reload_preview().await?;
                 }
             }
@@ -398,12 +402,13 @@ impl App {
                 if let Some(detail) = &self.detail {
                     if self.sort_index + 1 < detail.columns.len() {
                         self.sort_index += 1;
+                        self.sync_sort_from_index()?;
                         self.reload_preview().await?;
                     }
                 }
             }
             KeyCode::Char('s') => {
-                self.sort_desc = !self.sort_desc;
+                self.toggle_sort_direction()?;
                 self.reload_preview().await?;
             }
             KeyCode::Char('n') => {
@@ -495,96 +500,228 @@ impl App {
             return;
         }
 
-        let default_path = self.default_export_path();
+        let scope = ExportScope::VisiblePage;
+        let default_path = self.default_export_path(scope);
         self.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+            scope,
             value: default_path.display().to_string(),
+            edited: false,
         });
-        self.status = "Press Enter to export or edit the CSV path.".into();
+        self.status = "Press Enter to export CSV, edit the path, or Tab to change scope.".into();
     }
 
-    fn default_export_path(&self) -> PathBuf {
+    fn default_export_path(&self, scope: ExportScope) -> PathBuf {
         let file_name = self
             .detail
             .as_ref()
             .map(|detail| match &detail.table.schema {
-                Some(schema) => format!("{}_{}.csv", schema, detail.table.name),
-                None => format!("{}.csv", detail.table.name),
+                Some(schema) => format!(
+                    "{}_{}{}.csv",
+                    schema,
+                    detail.table.name,
+                    if scope == ExportScope::AllMatchingRows {
+                        "_all"
+                    } else {
+                        ""
+                    }
+                ),
+                None => format!(
+                    "{}{}.csv",
+                    detail.table.name,
+                    if scope == ExportScope::AllMatchingRows {
+                        "_all"
+                    } else {
+                        ""
+                    }
+                ),
             })
             .unwrap_or_else(|| "preview.csv".into());
         PathBuf::from("db_csv").join(file_name)
     }
 
-    fn handle_detail_export_prompt_key(&mut self, key: KeyEvent) {
+    async fn handle_detail_export_prompt_key(&mut self, key: KeyEvent) -> Result<()> {
         let Some(prompt) = self.detail_export_prompt.clone() else {
-            return;
+            return Ok(());
         };
 
         match prompt {
-            DetailExportPrompt::EnterPath { mut value } => match key.code {
+            DetailExportPrompt::EnterPath {
+                scope,
+                mut value,
+                mut edited,
+            } => match key.code {
                 KeyCode::Esc => {
                     self.detail_export_prompt = None;
                     self.status = "Canceled CSV export.".into();
                 }
                 KeyCode::Backspace => {
                     value.pop();
-                    self.detail_export_prompt = Some(DetailExportPrompt::EnterPath { value });
+                    edited = true;
+                    self.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+                        scope,
+                        value,
+                        edited,
+                    });
                 }
                 KeyCode::Enter => {
                     let trimmed = value.trim();
                     if trimmed.is_empty() {
-                        self.detail_export_prompt = Some(DetailExportPrompt::EnterPath { value });
+                        self.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+                            scope,
+                            value,
+                            edited,
+                        });
                         self.status = "Enter a non-empty CSV path or press Esc to cancel.".into();
                     } else {
                         let path = PathBuf::from(trimmed);
                         if path.exists() {
                             self.detail_export_prompt =
-                                Some(DetailExportPrompt::ConfirmOverwrite { value });
+                                Some(DetailExportPrompt::ConfirmOverwrite {
+                                    scope,
+                                    value,
+                                    edited,
+                                });
                             self.status = format!(
                                 "{} already exists. Press Enter to overwrite or Esc to keep editing.",
                                 path.display()
                             );
                         } else {
-                            self.export_preview_to_path(value);
+                            self.export_preview_to_path(scope, value, edited).await;
                         }
                     }
                 }
+                KeyCode::Tab => {
+                    let (scope, value, edited) = self.toggle_export_scope(scope, value, edited);
+                    self.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+                        scope,
+                        value,
+                        edited,
+                    });
+                    self.status = format!(
+                        "Export scope: {}. Press Enter to export CSV, edit the path, or Tab to change scope.",
+                        scope.label()
+                    );
+                }
                 KeyCode::Char(ch) => {
                     value.push(ch);
-                    self.detail_export_prompt = Some(DetailExportPrompt::EnterPath { value });
+                    edited = true;
+                    self.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+                        scope,
+                        value,
+                        edited,
+                    });
                 }
                 _ => {
-                    self.detail_export_prompt = Some(DetailExportPrompt::EnterPath { value });
+                    self.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+                        scope,
+                        value,
+                        edited,
+                    });
                 }
             },
-            DetailExportPrompt::ConfirmOverwrite { value } => match key.code {
+            DetailExportPrompt::ConfirmOverwrite {
+                scope,
+                value,
+                edited,
+            } => match key.code {
                 KeyCode::Esc => {
-                    self.detail_export_prompt = Some(DetailExportPrompt::EnterPath { value });
+                    self.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+                        scope,
+                        value,
+                        edited,
+                    });
                     self.status = "Returned to CSV path entry.".into();
                 }
-                KeyCode::Enter => self.export_preview_to_path(value),
+                KeyCode::Enter => self.export_preview_to_path(scope, value, edited).await,
                 _ => {
-                    self.detail_export_prompt =
-                        Some(DetailExportPrompt::ConfirmOverwrite { value });
+                    self.detail_export_prompt = Some(DetailExportPrompt::ConfirmOverwrite {
+                        scope,
+                        value,
+                        edited,
+                    });
                 }
             },
         }
+
+        Ok(())
     }
 
-    fn export_preview_to_path(&mut self, value: String) {
+    fn toggle_export_scope(
+        &self,
+        scope: ExportScope,
+        value: String,
+        edited: bool,
+    ) -> (ExportScope, String, bool) {
+        let next_scope = match scope {
+            ExportScope::VisiblePage => ExportScope::AllMatchingRows,
+            ExportScope::AllMatchingRows => ExportScope::VisiblePage,
+        };
+        if edited {
+            (next_scope, value, true)
+        } else {
+            (
+                next_scope,
+                self.default_export_path(next_scope).display().to_string(),
+                false,
+            )
+        }
+    }
+
+    async fn export_preview_to_path(&mut self, scope: ExportScope, value: String, edited: bool) {
         let path = PathBuf::from(value.trim());
-        let Some(preview) = self.preview.as_ref() else {
-            self.detail_export_prompt = None;
-            self.status = "No preview data loaded for export.".into();
-            return;
+        let request = ExportRequest {
+            format: ExportFormat::Csv,
+            scope,
+            path: path.clone(),
         };
 
-        match write_preview_csv(preview, &path) {
-            Ok(()) => {
+        let export_result = match scope {
+            ExportScope::VisiblePage => {
+                let Some(preview) = self.preview.as_ref() else {
+                    self.detail_export_prompt = None;
+                    self.status = "No preview data loaded for export.".into();
+                    return;
+                };
+                write_preview_csv(preview, &path).map(|rows_written| ExportSummary {
+                    rows_written,
+                    scope,
+                    path: path.clone(),
+                })
+            }
+            ExportScope::AllMatchingRows => match self.active_investigation() {
+                Ok(investigation) => {
+                    let investigation = investigation.clone();
+                    self.status = format!(
+                        "Exporting {} as CSV to {}...",
+                        scope.label(),
+                        path.display()
+                    );
+                    self.session()
+                        .unwrap()
+                        .export_csv(&investigation, &request)
+                        .await
+                }
+                Err(error) => Err(error),
+            },
+        };
+
+        match export_result {
+            Ok(summary) => {
                 self.detail_export_prompt = None;
-                self.status = format!("Exported CSV to {}.", path.display());
+                self.status = format!(
+                    "Exported {} row{} ({}) to {}.",
+                    summary.rows_written,
+                    if summary.rows_written == 1 { "" } else { "s" },
+                    summary.scope.label(),
+                    summary.path.display()
+                );
             }
             Err(error) => {
-                self.detail_export_prompt = Some(DetailExportPrompt::EnterPath { value });
+                self.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+                    scope,
+                    value,
+                    edited,
+                });
                 self.status = format!("CSV export failed: {error}");
             }
         }
@@ -665,11 +802,12 @@ impl App {
         self.detail_nav_stack.push(snapshot);
         self.open_detail_context(
             DetailNavStackEntry {
-                table: target_table.clone(),
-                filters: vec![target_filter],
-                sort_index: 0,
-                sort_desc: false,
-                page: 0,
+                investigation: InvestigationState {
+                    source: InvestigationSource::Table(target_table.clone()),
+                    sort: None,
+                    filters: vec![target_filter],
+                    page: 0,
+                },
                 selected_row: 0,
             },
             DetailView::Table,
@@ -841,9 +979,87 @@ impl App {
             .ok_or_else(|| anyhow!("filter column index out of range"))
     }
 
+    fn active_investigation(&self) -> Result<&InvestigationState> {
+        self.active_investigation
+            .as_ref()
+            .ok_or_else(|| anyhow!("no investigation state is loaded"))
+    }
+
+    fn active_investigation_mut(&mut self) -> Result<&mut InvestigationState> {
+        self.active_investigation
+            .as_mut()
+            .ok_or_else(|| anyhow!("no investigation state is loaded"))
+    }
+
+    fn active_filters(&self) -> &[PreviewFilter] {
+        self.active_investigation
+            .as_ref()
+            .map(|investigation| investigation.filters.as_slice())
+            .unwrap_or(&[])
+    }
+
+    fn ensure_sort_for_detail(
+        &self,
+        investigation: &mut InvestigationState,
+        detail: &TableDetail,
+    ) -> usize {
+        if detail.columns.is_empty() {
+            investigation.sort = None;
+            return 0;
+        }
+
+        if let Some(sort) = &investigation.sort {
+            if let Some(index) = detail
+                .columns
+                .iter()
+                .position(|column| column.name == sort.column_name)
+            {
+                return index;
+            }
+        }
+
+        investigation.sort = Some(SortState {
+            column_name: detail.columns[0].name.clone(),
+            descending: false,
+        });
+        0
+    }
+
+    fn sync_sort_from_index(&mut self) -> Result<()> {
+        let column_name = self.detail_column_name(self.sort_index)?.to_string();
+        let descending = self
+            .active_investigation
+            .as_ref()
+            .and_then(|investigation| investigation.sort.as_ref())
+            .map(|sort| sort.descending)
+            .unwrap_or(false);
+        self.active_investigation_mut()?.sort = Some(SortState {
+            column_name,
+            descending,
+        });
+        Ok(())
+    }
+
+    fn toggle_sort_direction(&mut self) -> Result<()> {
+        let column_name = self.detail_column_name(self.sort_index)?.to_string();
+        let next_descending = self
+            .active_investigation
+            .as_ref()
+            .and_then(|investigation| investigation.sort.as_ref())
+            .map(|sort| !sort.descending)
+            .unwrap_or(true);
+        self.active_investigation_mut()?.sort = Some(SortState {
+            column_name,
+            descending: next_descending,
+        });
+        Ok(())
+    }
+
     fn push_detail_filter(&mut self, filter: PreviewFilter) {
-        self.detail_filters.push(filter.clone());
-        self.detail_filter_index = self.detail_filters.len().saturating_sub(1);
+        if let Some(investigation) = &mut self.active_investigation {
+            investigation.filters.push(filter.clone());
+        }
+        self.detail_filter_index = self.active_filters().len().saturating_sub(1);
         self.detail_filter_prompt = None;
         self.reset_preview_page();
         self.status = format!("Applied filter: {}.", filter.summary());
@@ -851,18 +1067,23 @@ impl App {
 
     fn move_detail_filter_selection(&mut self, delta: isize) {
         self.detail_filter_index =
-            move_index(self.detail_filter_index, self.detail_filters.len(), delta);
+            move_index(self.detail_filter_index, self.active_filters().len(), delta);
     }
 
     fn remove_selected_detail_filter(&mut self) -> bool {
-        if self.detail_filters.is_empty() {
+        if self.active_filters().is_empty() {
             self.status = "No active filters to remove.".into();
             return false;
         }
 
-        let removed = self.detail_filters.remove(self.detail_filter_index);
-        if self.detail_filter_index >= self.detail_filters.len() {
-            self.detail_filter_index = self.detail_filters.len().saturating_sub(1);
+        let removed = self
+            .active_investigation
+            .as_mut()
+            .expect("filter removal requires investigation state")
+            .filters
+            .remove(self.detail_filter_index);
+        if self.detail_filter_index >= self.active_filters().len() {
+            self.detail_filter_index = self.active_filters().len().saturating_sub(1);
         }
         self.reset_preview_page();
         self.status = format!("Removed filter: {}.", removed.summary());
@@ -870,12 +1091,14 @@ impl App {
     }
 
     fn clear_detail_filters(&mut self) -> bool {
-        if self.detail_filters.is_empty() {
+        if self.active_filters().is_empty() {
             self.status = "No active filters to clear.".into();
             return false;
         }
 
-        self.detail_filters.clear();
+        if let Some(investigation) = &mut self.active_investigation {
+            investigation.filters.clear();
+        }
         self.detail_filter_index = 0;
         self.detail_filter_prompt = None;
         self.reset_preview_page();
@@ -915,17 +1138,8 @@ impl App {
     }
 
     fn current_detail_nav_entry(&self) -> Option<DetailNavStackEntry> {
-        let table = self.detail.as_ref()?.table.clone();
         Some(DetailNavStackEntry {
-            table,
-            filters: self.detail_filters.clone(),
-            sort_index: self.sort_index,
-            sort_desc: self.sort_desc,
-            page: self
-                .preview
-                .as_ref()
-                .map(|preview| preview.page)
-                .unwrap_or(0),
+            investigation: self.active_investigation.clone()?,
             selected_row: self.preview_row_index,
         })
     }
@@ -934,7 +1148,7 @@ impl App {
         let Some(entry) = self.detail_nav_stack.pop() else {
             return Ok(false);
         };
-        let table_name = entry.table.display_name();
+        let table_name = entry.investigation.table().display_name();
         self.open_detail_context(entry, DetailView::Table, false)
             .await?;
         self.status = format!("Returned to {table_name}.");
@@ -942,18 +1156,27 @@ impl App {
     }
 
     fn preview_page_forward(&mut self) {
+        if let Some(investigation) = &mut self.active_investigation {
+            investigation.page += 1;
+        }
         if let Some(preview) = &mut self.preview {
             preview.page += 1;
         }
     }
 
     fn preview_page_back(&mut self) {
+        if let Some(investigation) = &mut self.active_investigation {
+            investigation.page = investigation.page.saturating_sub(1);
+        }
         if let Some(preview) = &mut self.preview {
             preview.page = preview.page.saturating_sub(1);
         }
     }
 
     fn reset_preview_page(&mut self) {
+        if let Some(investigation) = &mut self.active_investigation {
+            investigation.page = 0;
+        }
         if let Some(preview) = &mut self.preview {
             preview.page = 0;
         }
@@ -971,8 +1194,8 @@ impl App {
         self.active_profile = Some(candidate.profile.clone());
         self.session = Some(session);
         self.detail = None;
+        self.active_investigation = None;
         self.detail_view = DetailView::Table;
-        self.detail_filters.clear();
         self.detail_filter_index = 0;
         self.detail_filter_prompt = None;
         self.detail_export_prompt = None;
@@ -986,7 +1209,6 @@ impl App {
         self.preview = None;
         self.preview_row_index = 0;
         self.sort_index = 0;
-        self.sort_desc = false;
 
         if self.session_kind() == Some(DatabaseKind::Postgres) {
             self.schemas = self.session().unwrap().list_schemas().await?;
@@ -1025,8 +1247,8 @@ impl App {
         self.table_filter.clear();
         self.table_search_mode = false;
         self.detail = None;
+        self.active_investigation = None;
         self.detail_view = DetailView::Table;
-        self.detail_filters.clear();
         self.detail_filter_index = 0;
         self.detail_filter_prompt = None;
         self.detail_export_prompt = None;
@@ -1058,11 +1280,7 @@ impl App {
     async fn load_table_detail(&mut self, table: TableRef, detail_view: DetailView) -> Result<()> {
         self.open_detail_context(
             DetailNavStackEntry {
-                table: table.clone(),
-                filters: Vec::new(),
-                sort_index: 0,
-                sort_desc: false,
-                page: 0,
+                investigation: InvestigationState::for_table(table.clone()),
                 selected_row: 0,
             },
             detail_view,
@@ -1079,15 +1297,17 @@ impl App {
         detail_view: DetailView,
         clear_drill_stack: bool,
     ) -> Result<()> {
-        let detail = self.session().unwrap().load_detail(&context.table).await?;
-        self.sort_index = context
-            .sort_index
-            .min(detail.columns.len().saturating_sub(1));
-        self.sort_desc = context.sort_desc;
+        let detail = self
+            .session()
+            .unwrap()
+            .load_detail(context.investigation.table())
+            .await?;
+        let mut investigation = context.investigation;
+        self.sort_index = self.ensure_sort_for_detail(&mut investigation, &detail);
         self.detail = Some(detail);
+        self.active_investigation = Some(investigation.clone());
         self.detail_view = detail_view;
-        self.detail_filters = context.filters;
-        self.detail_filter_index = self.detail_filters.len().saturating_sub(1);
+        self.detail_filter_index = investigation.filters.len().saturating_sub(1);
         self.detail_filter_prompt = None;
         self.detail_export_prompt = None;
         self.detail_drill_actions = None;
@@ -1102,7 +1322,7 @@ impl App {
         self.preview = Some(DataPreview {
             columns: Vec::new(),
             rows: Vec::new(),
-            page: context.page,
+            page: investigation.page,
             has_more: false,
         });
         self.preview_row_index = context.selected_row;
@@ -1115,16 +1335,11 @@ impl App {
     }
 
     async fn reload_preview(&mut self) -> Result<()> {
-        let table = self
-            .detail
+        let investigation = self
+            .active_investigation
             .as_ref()
-            .map(|detail| detail.table.clone())
-            .ok_or_else(|| anyhow!("no table detail is loaded"))?;
-        let preview = self
-            .session()
-            .unwrap()
-            .load_preview(&table, &self.current_preview_request())
-            .await?;
+            .ok_or_else(|| anyhow!("no investigation state is loaded"))?;
+        let preview = self.session().unwrap().load_preview(investigation).await?;
         self.preview = Some(preview);
         self.clamp_preview_row_index();
         self.detail_drill_actions = None;
@@ -1284,24 +1499,9 @@ impl App {
     }
 
     fn current_sort(&self) -> Option<SortState> {
-        let detail = self.detail.as_ref()?;
-        let column = detail.columns.get(self.sort_index)?;
-        Some(SortState {
-            column_name: column.name.clone(),
-            descending: self.sort_desc,
-        })
-    }
-
-    fn current_preview_request(&self) -> PreviewRequest {
-        PreviewRequest {
-            sort: self.current_sort(),
-            filters: self.detail_filters.clone(),
-            page: self
-                .preview
-                .as_ref()
-                .map(|preview| preview.page)
-                .unwrap_or(0),
-        }
+        self.active_investigation
+            .as_ref()
+            .and_then(|investigation| investigation.sort.clone())
     }
 
     fn is_input_mode_active(&self) -> bool {
@@ -1335,7 +1535,7 @@ impl App {
                     Some(DetailExportPrompt::EnterPath { .. })
                 ) =>
             {
-                "Type path | Enter export | Esc cancel"
+                "Type path | Tab scope | Enter export | Esc cancel"
             }
             Screen::Detail
                 if matches!(
@@ -1587,7 +1787,7 @@ impl App {
         frame.render_widget(metadata, metadata_sections[0]);
 
         let filters = Paragraph::new(detail_filter_lines(
-            &self.detail_filters,
+            self.active_filters(),
             self.detail_filter_index,
         ))
         .block(
@@ -1602,7 +1802,7 @@ impl App {
         let preview_title = preview_title(
             preview,
             self.current_sort().as_ref(),
-            self.detail_filters.len(),
+            self.active_filters().len(),
         );
         let preview_widget = render_preview(preview, &detail.columns, preview_title);
         let mut preview_state = TableState::default();
@@ -1630,17 +1830,19 @@ impl App {
         frame.render_widget(Clear, popup);
 
         let widget = match prompt {
-            DetailExportPrompt::EnterPath { value } => Paragraph::new(vec![
-                Line::from("Export the visible preview page as CSV."),
-                Line::from("Edit the path or press Enter to export."),
+            DetailExportPrompt::EnterPath { scope, value, .. } => Paragraph::new(vec![
+                Line::from(format!("Export {} as CSV.", scope.label())),
+                Line::from("Edit the path, press Enter to export, or Tab to change scope."),
                 Line::from(""),
+                Line::from(format!("Scope: {}", scope.label())),
                 Line::from(format!("Path: {value}")),
             ])
             .block(Block::default().title("Export CSV").borders(Borders::ALL)),
-            DetailExportPrompt::ConfirmOverwrite { value } => Paragraph::new(vec![
+            DetailExportPrompt::ConfirmOverwrite { scope, value, .. } => Paragraph::new(vec![
                 Line::from("This file already exists."),
                 Line::from("Press Enter to overwrite or Esc to return."),
                 Line::from(""),
+                Line::from(format!("Scope: {}", scope.label())),
                 Line::from(format!("Path: {}", value.trim())),
             ])
             .block(
@@ -2600,8 +2802,8 @@ mod tests {
             active_profile: None,
             active_schema: None,
             detail: None,
+            active_investigation: None,
             detail_view: DetailView::Table,
-            detail_filters: Vec::new(),
             detail_filter_index: 0,
             detail_filter_prompt: None,
             detail_export_prompt: None,
@@ -2615,12 +2817,32 @@ mod tests {
             preview: None,
             preview_row_index: 0,
             sort_index: 0,
-            sort_desc: false,
             status: String::new(),
             example_config: String::new(),
             pending_auto_connect: false,
             startup_target: None,
         }
+    }
+
+    fn sample_investigation(page: usize) -> InvestigationState {
+        InvestigationState {
+            source: InvestigationSource::Table(TableRef {
+                schema: None,
+                name: "tasks".into(),
+            }),
+            sort: Some(SortState {
+                column_name: "id".into(),
+                descending: false,
+            }),
+            filters: Vec::new(),
+            page,
+        }
+    }
+
+    fn seed_sample_detail_state(app: &mut App, page: usize) {
+        app.detail = Some(sample_graph_detail());
+        app.active_investigation = Some(sample_investigation(page));
+        app.sort_index = 0;
     }
 
     fn sample_mcp_context() -> McpContext {
@@ -3021,7 +3243,7 @@ mod tests {
     #[test]
     fn value_filter_application_resets_preview_page() {
         let mut app = test_app(Screen::Detail, false);
-        app.detail = Some(sample_graph_detail());
+        seed_sample_detail_state(&mut app, 3);
         app.preview = Some(DataPreview {
             columns: vec![],
             rows: vec![],
@@ -3040,16 +3262,16 @@ mod tests {
 
         assert_eq!(outcome, DetailFilterOutcome::ReloadPreview);
         assert_eq!(app.preview.as_ref().unwrap().page, 0);
-        assert_eq!(app.detail_filters.len(), 1);
-        assert_eq!(app.detail_filters[0].column_name, "title");
-        assert_eq!(app.detail_filters[0].value.as_deref(), Some("page"));
+        assert_eq!(app.active_filters().len(), 1);
+        assert_eq!(app.active_filters()[0].column_name, "title");
+        assert_eq!(app.active_filters()[0].value.as_deref(), Some("page"));
         assert!(app.detail_filter_prompt.is_none());
     }
 
     #[test]
     fn null_filter_application_skips_value_entry() {
         let mut app = test_app(Screen::Detail, false);
-        app.detail = Some(sample_graph_detail());
+        seed_sample_detail_state(&mut app, 2);
         app.preview = Some(DataPreview {
             columns: vec![],
             rows: vec![],
@@ -3070,22 +3292,23 @@ mod tests {
 
         assert_eq!(outcome, DetailFilterOutcome::ReloadPreview);
         assert_eq!(app.preview.as_ref().unwrap().page, 0);
-        assert_eq!(app.detail_filters.len(), 1);
-        assert_eq!(app.detail_filters[0].column_name, "owner_id");
-        assert_eq!(app.detail_filters[0].operator, FilterOperator::IsNull);
-        assert!(app.detail_filters[0].value.is_none());
+        assert_eq!(app.active_filters().len(), 1);
+        assert_eq!(app.active_filters()[0].column_name, "owner_id");
+        assert_eq!(app.active_filters()[0].operator, FilterOperator::IsNull);
+        assert!(app.active_filters()[0].value.is_none());
     }
 
     #[test]
     fn remove_selected_filter_clamps_index_and_resets_page() {
         let mut app = test_app(Screen::Detail, false);
+        seed_sample_detail_state(&mut app, 4);
         app.preview = Some(DataPreview {
             columns: vec![],
             rows: vec![],
             page: 4,
             has_more: false,
         });
-        app.detail_filters = vec![
+        app.active_investigation.as_mut().unwrap().filters = vec![
             PreviewFilter {
                 column_name: "status".into(),
                 operator: FilterOperator::Equals,
@@ -3102,8 +3325,8 @@ mod tests {
         assert!(app.remove_selected_detail_filter());
         assert_eq!(app.preview.as_ref().unwrap().page, 0);
         assert_eq!(app.detail_filter_index, 0);
-        assert_eq!(app.detail_filters.len(), 1);
-        assert_eq!(app.detail_filters[0].column_name, "status");
+        assert_eq!(app.active_filters().len(), 1);
+        assert_eq!(app.active_filters()[0].column_name, "status");
     }
 
     #[tokio::test]
@@ -3131,7 +3354,7 @@ mod tests {
     #[tokio::test]
     async fn e_opens_export_prompt_from_detail_view() {
         let mut app = test_app(Screen::Detail, false);
-        app.detail = Some(sample_graph_detail());
+        seed_sample_detail_state(&mut app, 0);
         app.preview = Some(sample_preview());
 
         app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
@@ -3140,18 +3363,23 @@ mod tests {
 
         assert!(matches!(
             app.detail_export_prompt,
-            Some(DetailExportPrompt::EnterPath { ref value }) if value == "db_csv/tasks.csv"
+            Some(DetailExportPrompt::EnterPath { scope: ExportScope::VisiblePage, ref value, edited: false }) if value == "db_csv/tasks.csv"
         ));
-        assert_eq!(app.status, "Press Enter to export or edit the CSV path.");
+        assert_eq!(
+            app.status,
+            "Press Enter to export CSV, edit the path, or Tab to change scope."
+        );
     }
 
     #[tokio::test]
     async fn q_is_export_input_while_entering_csv_path() {
         let mut app = test_app(Screen::Detail, false);
-        app.detail = Some(sample_graph_detail());
+        seed_sample_detail_state(&mut app, 0);
         app.preview = Some(sample_preview());
         app.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+            scope: ExportScope::VisiblePage,
             value: String::new(),
+            edited: false,
         });
 
         let should_quit = app
@@ -3162,16 +3390,46 @@ mod tests {
         assert!(!should_quit);
         assert!(matches!(
             app.detail_export_prompt,
-            Some(DetailExportPrompt::EnterPath { ref value }) if value == "q"
+            Some(DetailExportPrompt::EnterPath { ref value, .. }) if value == "q"
         ));
+    }
+
+    #[tokio::test]
+    async fn tab_toggles_export_scope_without_overwriting_default_path_state() {
+        let mut app = test_app(Screen::Detail, false);
+        seed_sample_detail_state(&mut app, 0);
+        app.preview = Some(sample_preview());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            app.detail_export_prompt,
+            Some(DetailExportPrompt::EnterPath {
+                scope: ExportScope::AllMatchingRows,
+                ref value,
+                edited: false
+            }) if value == "db_csv/tasks_all.csv"
+        ));
+        assert_eq!(
+            app.status,
+            "Export scope: all matching rows. Press Enter to export CSV, edit the path, or Tab to change scope."
+        );
     }
 
     #[tokio::test]
     async fn blank_export_path_is_rejected() {
         let mut app = test_app(Screen::Detail, false);
-        app.detail = Some(sample_graph_detail());
+        seed_sample_detail_state(&mut app, 0);
         app.preview = Some(sample_preview());
-        let default_value = app.default_export_path().display().to_string();
+        let default_value = app
+            .default_export_path(ExportScope::VisiblePage)
+            .display()
+            .to_string();
 
         app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
             .await
@@ -3188,7 +3446,7 @@ mod tests {
 
         assert!(matches!(
             app.detail_export_prompt,
-            Some(DetailExportPrompt::EnterPath { ref value }) if value.is_empty()
+            Some(DetailExportPrompt::EnterPath { ref value, .. }) if value.is_empty()
         ));
         assert_eq!(
             app.status,
@@ -3199,13 +3457,15 @@ mod tests {
     #[tokio::test]
     async fn export_existing_file_requires_confirmation_before_overwrite() {
         let mut app = test_app(Screen::Detail, false);
-        app.detail = Some(sample_graph_detail());
+        seed_sample_detail_state(&mut app, 0);
         app.preview = Some(sample_preview());
         let path = temp_csv_path("confirm");
         fs::write(&path, "old").unwrap();
         let value = path.display().to_string();
         app.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+            scope: ExportScope::VisiblePage,
             value: value.clone(),
+            edited: true,
         });
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
@@ -3214,7 +3474,7 @@ mod tests {
 
         assert!(matches!(
             app.detail_export_prompt,
-            Some(DetailExportPrompt::ConfirmOverwrite { value: ref prompt_value }) if prompt_value == &value
+            Some(DetailExportPrompt::ConfirmOverwrite { value: ref prompt_value, scope: ExportScope::VisiblePage, .. }) if prompt_value == &value
         ));
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
@@ -3223,7 +3483,7 @@ mod tests {
 
         assert!(matches!(
             app.detail_export_prompt,
-            Some(DetailExportPrompt::EnterPath { value: ref prompt_value }) if prompt_value == &value
+            Some(DetailExportPrompt::EnterPath { value: ref prompt_value, scope: ExportScope::VisiblePage, .. }) if prompt_value == &value
         ));
         fs::remove_file(&path).ok();
     }
@@ -3231,12 +3491,14 @@ mod tests {
     #[tokio::test]
     async fn export_prompt_writes_csv_and_updates_status() {
         let mut app = test_app(Screen::Detail, false);
-        app.detail = Some(sample_graph_detail());
+        seed_sample_detail_state(&mut app, 0);
         app.preview = Some(sample_preview());
         let path = temp_csv_path("success");
         let value = path.display().to_string();
         app.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+            scope: ExportScope::VisiblePage,
             value: value.clone(),
+            edited: true,
         });
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
@@ -3252,7 +3514,10 @@ mod tests {
         fs::remove_file(&path).ok();
 
         assert!(app.detail_export_prompt.is_none());
-        assert_eq!(app.status, format!("Exported CSV to {value}."));
+        assert_eq!(
+            app.status,
+            format!("Exported 2 rows (visible page) to {value}.")
+        );
         assert_eq!(
             headers.iter().collect::<Vec<_>>(),
             vec!["id", "project_id", "owner_id", "title"]
@@ -3264,14 +3529,16 @@ mod tests {
     #[tokio::test]
     async fn export_failure_keeps_prompt_open_and_reports_status() {
         let mut app = test_app(Screen::Detail, false);
-        app.detail = Some(sample_graph_detail());
+        seed_sample_detail_state(&mut app, 0);
         app.preview = Some(sample_preview());
         let parent = temp_csv_path("failure_parent");
         fs::write(&parent, "not a directory").unwrap();
         let path = parent.join("export.csv");
         let value = path.display().to_string();
         app.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+            scope: ExportScope::VisiblePage,
             value: value.clone(),
+            edited: true,
         });
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
@@ -3280,7 +3547,7 @@ mod tests {
 
         assert!(matches!(
             app.detail_export_prompt,
-            Some(DetailExportPrompt::EnterPath { value: ref prompt_value }) if prompt_value == &value
+            Some(DetailExportPrompt::EnterPath { value: ref prompt_value, scope: ExportScope::VisiblePage, .. }) if prompt_value == &value
         ));
         assert!(app.status.starts_with("CSV export failed: "));
         fs::remove_file(&parent).ok();
@@ -3541,20 +3808,22 @@ mod tests {
         )
         .await
         .unwrap();
-        app.detail_filters = vec![PreviewFilter {
+        app.active_investigation.as_mut().unwrap().filters = vec![PreviewFilter {
             column_name: "status".into(),
             operator: FilterOperator::Equals,
             value: Some("todo".into()),
         }];
         app.sort_index = 0;
-        app.sort_desc = false;
+        app.sync_sort_from_index().unwrap();
         app.reload_preview().await.unwrap();
 
         let expected_preview = app.preview.clone().unwrap();
         let export_path = temp_csv_path("sample_preview");
         let export_value = export_path.display().to_string();
         app.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+            scope: ExportScope::VisiblePage,
             value: export_value.clone(),
+            edited: true,
         });
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
@@ -3570,7 +3839,10 @@ mod tests {
         fs::remove_file(&export_path).ok();
 
         assert!(app.detail_export_prompt.is_none());
-        assert_eq!(app.status, format!("Exported CSV to {export_value}."));
+        assert_eq!(
+            app.status,
+            format!("Exported 2 rows (visible page) to {export_value}.")
+        );
         assert_eq!(
             headers.iter().map(str::to_string).collect::<Vec<_>>(),
             expected_preview.columns
@@ -3611,7 +3883,7 @@ mod tests {
         .await
         .unwrap();
         app.sort_index = 0;
-        app.sort_desc = false;
+        app.sync_sort_from_index().unwrap();
         app.reload_preview().await.unwrap();
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
@@ -3623,9 +3895,9 @@ mod tests {
 
         assert_eq!(app.detail.as_ref().unwrap().table.name, "projects");
         assert_eq!(app.detail_nav_stack.len(), 1);
-        assert_eq!(app.detail_filters.len(), 1);
-        assert_eq!(app.detail_filters[0].column_name, "id");
-        assert_eq!(app.detail_filters[0].value.as_deref(), Some("1"));
+        assert_eq!(app.active_filters().len(), 1);
+        assert_eq!(app.active_filters()[0].column_name, "id");
+        assert_eq!(app.active_filters()[0].value.as_deref(), Some("1"));
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .await
@@ -3634,7 +3906,7 @@ mod tests {
         assert_eq!(app.detail.as_ref().unwrap().table.name, "tasks");
         assert_eq!(app.detail_nav_stack.len(), 0);
         assert_eq!(app.preview_row_index, 0);
-        assert!(app.detail_filters.is_empty());
+        assert!(app.active_filters().is_empty());
     }
 
     #[tokio::test]
