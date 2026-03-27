@@ -12,6 +12,8 @@ use crate::{
 pub struct McpContext {
     #[serde(default)]
     pub profile: Option<ConnectionProfile>,
+    #[serde(default)]
+    pub target_bookmark: Option<String>,
     #[serde(default, alias = "preferred_schema")]
     pub target_schema: Option<String>,
     #[serde(default)]
@@ -64,5 +66,13 @@ mod tests {
 
         assert_eq!(context.target_schema.as_deref(), Some("public"));
         assert_eq!(context.target_table.as_deref(), Some("tasks"));
+    }
+
+    #[test]
+    fn target_bookmark_parses_when_present() {
+        let context: McpContext =
+            serde_json::from_str(r#"{"target_bookmark":"incident-root"}"#).unwrap();
+
+        assert_eq!(context.target_bookmark.as_deref(), Some("incident-root"));
     }
 }
