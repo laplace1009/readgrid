@@ -26,7 +26,7 @@ use crate::{
         ExportRequest, ExportScope, ExportSummary, FilterOperator, ForeignKeyMeta,
         InvestigationSource, InvestigationState, PreviewFilter, RelationGraph, RelationNode,
         RelationNodeRole, Session, SortState, TableDetail, TableRef, build_drill_through_actions,
-        write_preview_csv,
+        write_preview_export,
     },
     mcp::McpContext,
 };
@@ -97,11 +97,13 @@ enum DetailFilterPrompt {
 #[derive(Debug, Clone)]
 enum DetailExportPrompt {
     EnterPath {
+        format: ExportFormat,
         scope: ExportScope,
         value: String,
         edited: bool,
     },
     ConfirmOverwrite {
+        format: ExportFormat,
         scope: ExportScope,
         value: String,
         edited: bool,
@@ -500,42 +502,38 @@ impl App {
             return;
         }
 
+        let format = ExportFormat::Csv;
         let scope = ExportScope::VisiblePage;
-        let default_path = self.default_export_path(scope);
+        let default_path = self.default_export_path(format, scope);
         self.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+            format,
             scope,
             value: default_path.display().to_string(),
             edited: false,
         });
-        self.status = "Press Enter to export CSV, edit the path, or Tab to change scope.".into();
+        self.status = "Press Enter to export, Tab to change scope, or f to change format.".into();
     }
 
-    fn default_export_path(&self, scope: ExportScope) -> PathBuf {
+    fn default_export_path(&self, format: ExportFormat, scope: ExportScope) -> PathBuf {
         let file_name = self
             .detail
             .as_ref()
             .map(|detail| match &detail.table.schema {
                 Some(schema) => format!(
-                    "{}_{}{}.csv",
+                    "{}_{}{}.{}",
                     schema,
                     detail.table.name,
-                    if scope == ExportScope::AllMatchingRows {
-                        "_all"
-                    } else {
-                        ""
-                    }
+                    scope.file_suffix(),
+                    format.extension(),
                 ),
                 None => format!(
-                    "{}{}.csv",
+                    "{}{}.{}",
                     detail.table.name,
-                    if scope == ExportScope::AllMatchingRows {
-                        "_all"
-                    } else {
-                        ""
-                    }
+                    scope.file_suffix(),
+                    format.extension(),
                 ),
             })
-            .unwrap_or_else(|| "preview.csv".into());
+            .unwrap_or_else(|| format!("preview.{}", format.extension()));
         PathBuf::from("db_csv").join(file_name)
     }
 
@@ -546,18 +544,20 @@ impl App {
 
         match prompt {
             DetailExportPrompt::EnterPath {
+                format,
                 scope,
                 mut value,
                 mut edited,
             } => match key.code {
                 KeyCode::Esc => {
                     self.detail_export_prompt = None;
-                    self.status = "Canceled CSV export.".into();
+                    self.status = "Canceled export.".into();
                 }
                 KeyCode::Backspace => {
                     value.pop();
                     edited = true;
                     self.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+                        format,
                         scope,
                         value,
                         edited,
@@ -567,16 +567,19 @@ impl App {
                     let trimmed = value.trim();
                     if trimmed.is_empty() {
                         self.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+                            format,
                             scope,
                             value,
                             edited,
                         });
-                        self.status = "Enter a non-empty CSV path or press Esc to cancel.".into();
+                        self.status =
+                            "Enter a non-empty export path or press Esc to cancel.".into();
                     } else {
                         let path = PathBuf::from(trimmed);
                         if path.exists() {
                             self.detail_export_prompt =
                                 Some(DetailExportPrompt::ConfirmOverwrite {
+                                    format,
                                     scope,
                                     value,
                                     edited,
@@ -586,26 +589,46 @@ impl App {
                                 path.display()
                             );
                         } else {
-                            self.export_preview_to_path(scope, value, edited).await;
+                            self.export_preview_to_path(format, scope, value, edited)
+                                .await;
                         }
                     }
                 }
                 KeyCode::Tab => {
-                    let (scope, value, edited) = self.toggle_export_scope(scope, value, edited);
+                    let (scope, value, edited) =
+                        self.toggle_export_scope(format, scope, value, edited);
                     self.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+                        format,
                         scope,
                         value,
                         edited,
                     });
                     self.status = format!(
-                        "Export scope: {}. Press Enter to export CSV, edit the path, or Tab to change scope.",
-                        scope.label()
+                        "Export {} as {}. Press Enter to export, Tab to change scope, or f to change format.",
+                        scope.label(),
+                        format.label()
+                    );
+                }
+                KeyCode::Char('f') if !edited => {
+                    let (format, value, edited) =
+                        self.toggle_export_format(format, scope, value, edited);
+                    self.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+                        format,
+                        scope,
+                        value,
+                        edited,
+                    });
+                    self.status = format!(
+                        "Export {} as {}. Press Enter to export, Tab to change scope, or f to change format.",
+                        scope.label(),
+                        format.label()
                     );
                 }
                 KeyCode::Char(ch) => {
                     value.push(ch);
                     edited = true;
                     self.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+                        format,
                         scope,
                         value,
                         edited,
@@ -613,6 +636,7 @@ impl App {
                 }
                 _ => {
                     self.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+                        format,
                         scope,
                         value,
                         edited,
@@ -620,21 +644,27 @@ impl App {
                 }
             },
             DetailExportPrompt::ConfirmOverwrite {
+                format,
                 scope,
                 value,
                 edited,
             } => match key.code {
                 KeyCode::Esc => {
                     self.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+                        format,
                         scope,
                         value,
                         edited,
                     });
-                    self.status = "Returned to CSV path entry.".into();
+                    self.status = "Returned to export path entry.".into();
                 }
-                KeyCode::Enter => self.export_preview_to_path(scope, value, edited).await,
+                KeyCode::Enter => {
+                    self.export_preview_to_path(format, scope, value, edited)
+                        .await
+                }
                 _ => {
                     self.detail_export_prompt = Some(DetailExportPrompt::ConfirmOverwrite {
+                        format,
                         scope,
                         value,
                         edited,
@@ -648,6 +678,7 @@ impl App {
 
     fn toggle_export_scope(
         &self,
+        format: ExportFormat,
         scope: ExportScope,
         value: String,
         edited: bool,
@@ -661,16 +692,48 @@ impl App {
         } else {
             (
                 next_scope,
-                self.default_export_path(next_scope).display().to_string(),
+                self.default_export_path(format, next_scope)
+                    .display()
+                    .to_string(),
                 false,
             )
         }
     }
 
-    async fn export_preview_to_path(&mut self, scope: ExportScope, value: String, edited: bool) {
+    fn toggle_export_format(
+        &self,
+        format: ExportFormat,
+        scope: ExportScope,
+        value: String,
+        edited: bool,
+    ) -> (ExportFormat, String, bool) {
+        let next_format = match format {
+            ExportFormat::Csv => ExportFormat::Json,
+            ExportFormat::Json => ExportFormat::Csv,
+        };
+        if edited {
+            (next_format, value, true)
+        } else {
+            (
+                next_format,
+                self.default_export_path(next_format, scope)
+                    .display()
+                    .to_string(),
+                false,
+            )
+        }
+    }
+
+    async fn export_preview_to_path(
+        &mut self,
+        format: ExportFormat,
+        scope: ExportScope,
+        value: String,
+        edited: bool,
+    ) {
         let path = PathBuf::from(value.trim());
         let request = ExportRequest {
-            format: ExportFormat::Csv,
+            format,
             scope,
             path: path.clone(),
         };
@@ -682,8 +745,9 @@ impl App {
                     self.status = "No preview data loaded for export.".into();
                     return;
                 };
-                write_preview_csv(preview, &path).map(|rows_written| ExportSummary {
+                write_preview_export(preview, &request).map(|rows_written| ExportSummary {
                     rows_written,
+                    format,
                     scope,
                     path: path.clone(),
                 })
@@ -692,13 +756,14 @@ impl App {
                 Ok(investigation) => {
                     let investigation = investigation.clone();
                     self.status = format!(
-                        "Exporting {} as CSV to {}...",
+                        "Exporting {} as {} to {}...",
                         scope.label(),
+                        format.label(),
                         path.display()
                     );
                     self.session()
                         .unwrap()
-                        .export_csv(&investigation, &request)
+                        .export(&investigation, &request)
                         .await
                 }
                 Err(error) => Err(error),
@@ -709,20 +774,22 @@ impl App {
             Ok(summary) => {
                 self.detail_export_prompt = None;
                 self.status = format!(
-                    "Exported {} row{} ({}) to {}.",
+                    "Exported {} row{} as {} ({}) to {}.",
                     summary.rows_written,
                     if summary.rows_written == 1 { "" } else { "s" },
+                    summary.format.label(),
                     summary.scope.label(),
                     summary.path.display()
                 );
             }
             Err(error) => {
                 self.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+                    format,
                     scope,
                     value,
                     edited,
                 });
-                self.status = format!("CSV export failed: {error}");
+                self.status = format!("{} export failed: {error}", format.label());
             }
         }
     }
@@ -1535,7 +1602,7 @@ impl App {
                     Some(DetailExportPrompt::EnterPath { .. })
                 ) =>
             {
-                "Type path | Tab scope | Enter export | Esc cancel"
+                "Type path | Tab scope | f format | Enter export | Esc cancel"
             }
             Screen::Detail
                 if matches!(
@@ -1830,26 +1897,34 @@ impl App {
         frame.render_widget(Clear, popup);
 
         let widget = match prompt {
-            DetailExportPrompt::EnterPath { scope, value, .. } => Paragraph::new(vec![
-                Line::from(format!("Export {} as CSV.", scope.label())),
-                Line::from("Edit the path, press Enter to export, or Tab to change scope."),
+            DetailExportPrompt::EnterPath {
+                format,
+                scope,
+                value,
+                ..
+            } => Paragraph::new(vec![
+                Line::from(format!("Export {} as {}.", scope.label(), format.label())),
+                Line::from("Edit the path, press Enter to export, Tab to change scope, or f to change format."),
                 Line::from(""),
+                Line::from(format!("Format: {}", format.label())),
                 Line::from(format!("Scope: {}", scope.label())),
                 Line::from(format!("Path: {value}")),
             ])
-            .block(Block::default().title("Export CSV").borders(Borders::ALL)),
-            DetailExportPrompt::ConfirmOverwrite { scope, value, .. } => Paragraph::new(vec![
+            .block(Block::default().title("Export").borders(Borders::ALL)),
+            DetailExportPrompt::ConfirmOverwrite {
+                format,
+                scope,
+                value,
+                ..
+            } => Paragraph::new(vec![
                 Line::from("This file already exists."),
                 Line::from("Press Enter to overwrite or Esc to return."),
                 Line::from(""),
+                Line::from(format!("Format: {}", format.label())),
                 Line::from(format!("Scope: {}", scope.label())),
                 Line::from(format!("Path: {}", value.trim())),
             ])
-            .block(
-                Block::default()
-                    .title("Overwrite CSV?")
-                    .borders(Borders::ALL),
-            ),
+            .block(Block::default().title("Overwrite Export?").borders(Borders::ALL)),
         }
         .wrap(Wrap { trim: false });
         frame.render_widget(widget, popup);
@@ -3064,6 +3139,19 @@ mod tests {
         ))
     }
 
+    fn temp_export_path(name: &str, extension: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "readgrid_app_{name}_{}_{}.{}",
+            std::process::id(),
+            unique,
+            extension
+        ))
+    }
+
     #[test]
     fn graph_lane_title_marks_center_as_current() {
         assert_eq!(graph_lane_title(GraphLane::Center), "Center (current)");
@@ -3363,11 +3451,16 @@ mod tests {
 
         assert!(matches!(
             app.detail_export_prompt,
-            Some(DetailExportPrompt::EnterPath { scope: ExportScope::VisiblePage, ref value, edited: false }) if value == "db_csv/tasks.csv"
+            Some(DetailExportPrompt::EnterPath {
+                format: ExportFormat::Csv,
+                scope: ExportScope::VisiblePage,
+                ref value,
+                edited: false
+            }) if value == "db_csv/tasks.csv"
         ));
         assert_eq!(
             app.status,
-            "Press Enter to export CSV, edit the path, or Tab to change scope."
+            "Press Enter to export, Tab to change scope, or f to change format."
         );
     }
 
@@ -3377,6 +3470,7 @@ mod tests {
         seed_sample_detail_state(&mut app, 0);
         app.preview = Some(sample_preview());
         app.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+            format: ExportFormat::Csv,
             scope: ExportScope::VisiblePage,
             value: String::new(),
             edited: false,
@@ -3410,6 +3504,7 @@ mod tests {
         assert!(matches!(
             app.detail_export_prompt,
             Some(DetailExportPrompt::EnterPath {
+                format: ExportFormat::Csv,
                 scope: ExportScope::AllMatchingRows,
                 ref value,
                 edited: false
@@ -3417,8 +3512,58 @@ mod tests {
         ));
         assert_eq!(
             app.status,
-            "Export scope: all matching rows. Press Enter to export CSV, edit the path, or Tab to change scope."
+            "Export all matching rows as CSV. Press Enter to export, Tab to change scope, or f to change format."
         );
+    }
+
+    #[tokio::test]
+    async fn f_toggles_export_format_without_overwriting_default_path_state() {
+        let mut app = test_app(Screen::Detail, false);
+        seed_sample_detail_state(&mut app, 0);
+        app.preview = Some(sample_preview());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            app.detail_export_prompt,
+            Some(DetailExportPrompt::EnterPath {
+                format: ExportFormat::Json,
+                scope: ExportScope::VisiblePage,
+                ref value,
+                edited: false
+            }) if value == "db_csv/tasks.json"
+        ));
+        assert_eq!(
+            app.status,
+            "Export visible page as JSON. Press Enter to export, Tab to change scope, or f to change format."
+        );
+    }
+
+    #[tokio::test]
+    async fn edited_export_path_accepts_literal_f_input() {
+        let mut app = test_app(Screen::Detail, false);
+        seed_sample_detail_state(&mut app, 0);
+        app.preview = Some(sample_preview());
+        app.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+            format: ExportFormat::Csv,
+            scope: ExportScope::VisiblePage,
+            value: String::from("/tmp/out"),
+            edited: true,
+        });
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            app.detail_export_prompt,
+            Some(DetailExportPrompt::EnterPath { ref value, .. }) if value == "/tmp/outf"
+        ));
     }
 
     #[tokio::test]
@@ -3427,7 +3572,7 @@ mod tests {
         seed_sample_detail_state(&mut app, 0);
         app.preview = Some(sample_preview());
         let default_value = app
-            .default_export_path(ExportScope::VisiblePage)
+            .default_export_path(ExportFormat::Csv, ExportScope::VisiblePage)
             .display()
             .to_string();
 
@@ -3450,7 +3595,7 @@ mod tests {
         ));
         assert_eq!(
             app.status,
-            "Enter a non-empty CSV path or press Esc to cancel."
+            "Enter a non-empty export path or press Esc to cancel."
         );
     }
 
@@ -3463,6 +3608,7 @@ mod tests {
         fs::write(&path, "old").unwrap();
         let value = path.display().to_string();
         app.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+            format: ExportFormat::Csv,
             scope: ExportScope::VisiblePage,
             value: value.clone(),
             edited: true,
@@ -3474,7 +3620,12 @@ mod tests {
 
         assert!(matches!(
             app.detail_export_prompt,
-            Some(DetailExportPrompt::ConfirmOverwrite { value: ref prompt_value, scope: ExportScope::VisiblePage, .. }) if prompt_value == &value
+            Some(DetailExportPrompt::ConfirmOverwrite {
+                format: ExportFormat::Csv,
+                value: ref prompt_value,
+                scope: ExportScope::VisiblePage,
+                ..
+            }) if prompt_value == &value
         ));
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
@@ -3483,7 +3634,12 @@ mod tests {
 
         assert!(matches!(
             app.detail_export_prompt,
-            Some(DetailExportPrompt::EnterPath { value: ref prompt_value, scope: ExportScope::VisiblePage, .. }) if prompt_value == &value
+            Some(DetailExportPrompt::EnterPath {
+                format: ExportFormat::Csv,
+                value: ref prompt_value,
+                scope: ExportScope::VisiblePage,
+                ..
+            }) if prompt_value == &value
         ));
         fs::remove_file(&path).ok();
     }
@@ -3496,6 +3652,7 @@ mod tests {
         let path = temp_csv_path("success");
         let value = path.display().to_string();
         app.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+            format: ExportFormat::Csv,
             scope: ExportScope::VisiblePage,
             value: value.clone(),
             edited: true,
@@ -3516,7 +3673,7 @@ mod tests {
         assert!(app.detail_export_prompt.is_none());
         assert_eq!(
             app.status,
-            format!("Exported 2 rows (visible page) to {value}.")
+            format!("Exported 2 rows as CSV (visible page) to {value}.")
         );
         assert_eq!(
             headers.iter().collect::<Vec<_>>(),
@@ -3536,6 +3693,7 @@ mod tests {
         let path = parent.join("export.csv");
         let value = path.display().to_string();
         app.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+            format: ExportFormat::Csv,
             scope: ExportScope::VisiblePage,
             value: value.clone(),
             edited: true,
@@ -3547,7 +3705,12 @@ mod tests {
 
         assert!(matches!(
             app.detail_export_prompt,
-            Some(DetailExportPrompt::EnterPath { value: ref prompt_value, scope: ExportScope::VisiblePage, .. }) if prompt_value == &value
+            Some(DetailExportPrompt::EnterPath {
+                format: ExportFormat::Csv,
+                value: ref prompt_value,
+                scope: ExportScope::VisiblePage,
+                ..
+            }) if prompt_value == &value
         ));
         assert!(app.status.starts_with("CSV export failed: "));
         fs::remove_file(&parent).ok();
@@ -3821,6 +3984,7 @@ mod tests {
         let export_path = temp_csv_path("sample_preview");
         let export_value = export_path.display().to_string();
         app.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+            format: ExportFormat::Csv,
             scope: ExportScope::VisiblePage,
             value: export_value.clone(),
             edited: true,
@@ -3841,7 +4005,7 @@ mod tests {
         assert!(app.detail_export_prompt.is_none());
         assert_eq!(
             app.status,
-            format!("Exported 2 rows (visible page) to {export_value}.")
+            format!("Exported 2 rows as CSV (visible page) to {export_value}.")
         );
         assert_eq!(
             headers.iter().map(str::to_string).collect::<Vec<_>>(),
@@ -3854,6 +4018,90 @@ mod tests {
                 .iter()
                 .map(|row| row.display_values())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn export_sample_preview_as_json_uses_preview_order_and_nulls() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("sample")
+            .join("readgrid_demo.db");
+        let session = Session::connect(&ConnectionProfile {
+            name: "sample".into(),
+            kind: DatabaseKind::Sqlite,
+            url: None,
+            path: Some(path),
+        })
+        .await
+        .unwrap();
+
+        let mut app = test_app(Screen::Detail, false);
+        app.session = Some(session);
+        app.load_table_detail(
+            TableRef {
+                schema: None,
+                name: "tasks".into(),
+            },
+            DetailView::Table,
+        )
+        .await
+        .unwrap();
+        app.active_investigation.as_mut().unwrap().filters = vec![PreviewFilter {
+            column_name: "status".into(),
+            operator: FilterOperator::Equals,
+            value: Some("todo".into()),
+        }];
+        app.sort_index = 0;
+        app.sync_sort_from_index().unwrap();
+        app.reload_preview().await.unwrap();
+
+        let expected_preview = app.preview.clone().unwrap();
+        let export_path = temp_export_path("sample_preview_json", "json");
+        let export_value = export_path.display().to_string();
+        app.detail_export_prompt = Some(DetailExportPrompt::EnterPath {
+            format: ExportFormat::Json,
+            scope: ExportScope::VisiblePage,
+            value: export_value.clone(),
+            edited: true,
+        });
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let raw = fs::read_to_string(&export_path).unwrap();
+        let rows = serde_json::from_str::<Vec<serde_json::Value>>(&raw).unwrap();
+        fs::remove_file(&export_path).ok();
+
+        assert!(app.detail_export_prompt.is_none());
+        assert_eq!(
+            app.status,
+            format!("Exported 2 rows as JSON (visible page) to {export_value}.")
+        );
+        assert_eq!(rows.len(), expected_preview.rows.len());
+        let first_object = raw
+            .strip_prefix('[')
+            .and_then(|text| text.split("},{").next())
+            .unwrap();
+        let id_pos = first_object.find(r#""id":"#).unwrap();
+        let project_pos = first_object.find(r#""project_id":"#).unwrap();
+        let assignee_pos = first_object.find(r#""assignee_id":"#).unwrap();
+        assert!(id_pos < project_pos);
+        assert!(project_pos < assignee_pos);
+        assert_eq!(rows[0]["owner_id"], serde_json::Value::Null);
+        let title_index = expected_preview
+            .columns
+            .iter()
+            .position(|column| column == "title")
+            .unwrap();
+        assert_eq!(
+            rows[0]["title"],
+            serde_json::Value::String(
+                expected_preview.rows[0].cells[title_index]
+                    .raw_value
+                    .clone()
+                    .unwrap()
+            )
         );
     }
 
