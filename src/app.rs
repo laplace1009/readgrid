@@ -1,7 +1,7 @@
 use std::{io::Stdout, path::PathBuf, time::Duration};
 
 use anyhow::{Result, anyhow};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
     terminal,
@@ -17,6 +17,7 @@ use ratatui::{
         Wrap,
     },
 };
+use serde::Deserialize;
 
 use crate::{
     config::ConfigStore,
@@ -41,7 +42,18 @@ pub struct CliArgs {
     #[arg(long)]
     pub schema: Option<String>,
     #[arg(long)]
+    pub table: Option<String>,
+    #[arg(long, value_enum)]
+    pub view: Option<StartupView>,
+    #[arg(long)]
     pub mcp_context_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupView {
+    Detail,
+    Graph,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,7 +109,19 @@ enum DetailFilterOutcome {
 struct ConnectionCandidate {
     profile: ConnectionProfile,
     source: &'static str,
-    preferred_schema: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct StartupTarget {
+    schema: Option<String>,
+    table: Option<String>,
+    view: Option<StartupView>,
+}
+
+impl StartupTarget {
+    fn is_empty(&self) -> bool {
+        self.schema.is_none() && self.table.is_none() && self.view.is_none()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +168,7 @@ pub struct App {
     status: String,
     example_config: String,
     pending_auto_connect: bool,
+    startup_target: Option<StartupTarget>,
 }
 
 impl App {
@@ -155,10 +180,16 @@ impl App {
         if args.pg_url.is_some() && args.sqlite_path.is_some() {
             return Err(anyhow!("use either --pg-url or --sqlite-path, not both"));
         }
+        if args.profile.is_some() && (args.pg_url.is_some() || args.sqlite_path.is_some()) {
+            return Err(anyhow!(
+                "use either --profile or a direct connection target, not both"
+            ));
+        }
 
         let example_config = ConfigStore::example_profiles();
+        let startup_target = build_startup_target(&args, mcp_context.as_ref());
         let (candidates, selected_index, pending_auto_connect) =
-            build_candidates(&args, &config, mcp_context);
+            build_candidates(&args, &config, mcp_context.as_ref());
 
         let status = if candidates.is_empty() {
             "No connection sources found. Use --pg-url/--sqlite-path or add profiles.toml.".into()
@@ -200,6 +231,7 @@ impl App {
             status,
             example_config,
             pending_auto_connect,
+            startup_target,
         })
     }
 
@@ -960,15 +992,6 @@ impl App {
             self.schemas = self.session().unwrap().list_schemas().await?;
             self.schema_index = 0;
             self.screen = Screen::Schemas;
-            if let Some(preferred) = candidate
-                .preferred_schema
-                .clone()
-                .or_else(|| self.find_selected_schema_hint())
-            {
-                if let Some(index) = self.schemas.iter().position(|schema| schema == &preferred) {
-                    self.schema_index = index;
-                }
-            }
             self.status = "Connected. Choose a schema and press Enter.".into();
         } else {
             self.active_schema = None;
@@ -976,6 +999,8 @@ impl App {
             self.screen = Screen::Browser;
             self.status = "Connected. Browse tables and press Enter for details.".into();
         }
+
+        self.continue_startup_after_connect().await?;
 
         Ok(())
     }
@@ -985,6 +1010,7 @@ impl App {
         self.load_tables(schema).await?;
         self.screen = Screen::Browser;
         self.status = "Schema loaded. Browse tables and press Enter for details.".into();
+        self.continue_startup_after_table_load().await?;
         Ok(())
     }
 
@@ -1131,6 +1157,130 @@ impl App {
         }
         self.status = "Viewing relationship graph.".into();
         Ok(())
+    }
+
+    async fn continue_startup_after_connect(&mut self) -> Result<()> {
+        let Some(mut target) = self.startup_target.clone() else {
+            return Ok(());
+        };
+
+        if self.session_kind() == Some(DatabaseKind::Sqlite) {
+            target.schema = None;
+            self.store_startup_target(target);
+            return self.continue_startup_after_table_load().await;
+        }
+
+        if self.screen != Screen::Schemas {
+            return Ok(());
+        }
+
+        let Some(schema_name) = target.schema.clone() else {
+            if target.table.is_some() || target.view.is_some() {
+                self.status = "Choose a schema to continue the requested startup target.".into();
+            }
+            self.store_startup_target(target);
+            return Ok(());
+        };
+
+        if let Some(index) = self
+            .schemas
+            .iter()
+            .position(|schema| schema == &schema_name)
+        {
+            self.schema_index = index;
+            target.schema = None;
+            self.store_startup_target(target);
+            self.load_tables_for_selected_schema().await?;
+        } else {
+            self.status =
+                format!("Schema '{schema_name}' was not found. Choose a schema to continue.");
+            target.schema = None;
+            self.store_startup_target(target);
+        }
+
+        Ok(())
+    }
+
+    async fn continue_startup_after_table_load(&mut self) -> Result<()> {
+        let Some(mut target) = self.startup_target.clone() else {
+            return Ok(());
+        };
+
+        if self.session_kind() == Some(DatabaseKind::Sqlite) {
+            target.schema = None;
+        }
+
+        if self.screen == Screen::Detail {
+            self.startup_target = None;
+            return Ok(());
+        }
+        if self.screen != Screen::Browser {
+            self.store_startup_target(target);
+            return Ok(());
+        }
+
+        if target.table.is_none() {
+            if let Some(view) = target.view {
+                self.status = format!(
+                    "Startup view '{}' requires a target table.",
+                    startup_view_label(view)
+                );
+                target.view = None;
+                self.store_startup_target(target);
+            }
+            return Ok(());
+        }
+
+        let table_name = target.table.clone().unwrap();
+        if let Some(index) = self
+            .tables
+            .iter()
+            .position(|table| table.name == table_name)
+        {
+            self.table_index = index;
+            if let Some(view) = target.view {
+                target.table = None;
+                target.view = None;
+                self.store_startup_target(target);
+
+                let table = self
+                    .selected_table()
+                    .ok_or_else(|| anyhow!("target table selection is unavailable"))?;
+                self.load_table_detail(table.clone(), startup_view_to_detail_view(view))
+                    .await?;
+                self.status = format!(
+                    "Opened {} in {} view.",
+                    table.display_name(),
+                    startup_view_label(view)
+                );
+            } else {
+                self.status = format!("Selected startup table {table_name}.");
+                target.table = None;
+                self.store_startup_target(target);
+            }
+        } else {
+            self.status = format!(
+                "Table '{}' was not found{}.",
+                table_name,
+                match self.active_schema.as_deref() {
+                    Some(schema) => format!(" in schema '{schema}'"),
+                    None => String::new(),
+                }
+            );
+            target.table = None;
+            target.view = None;
+            self.store_startup_target(target);
+        }
+
+        Ok(())
+    }
+
+    fn store_startup_target(&mut self, target: StartupTarget) {
+        self.startup_target = if target.is_empty() {
+            None
+        } else {
+            Some(target)
+        };
     }
 
     fn current_sort(&self) -> Option<SortState> {
@@ -1850,10 +2000,6 @@ impl App {
         );
     }
 
-    fn find_selected_schema_hint(&self) -> Option<String> {
-        None
-    }
-
     fn graph_center_visible_rows(&self) -> usize {
         terminal::size()
             .ok()
@@ -2146,7 +2292,7 @@ fn graph_lane_title(lane: GraphLane) -> &'static str {
 fn build_candidates(
     args: &CliArgs,
     config: &ConfigStore,
-    mcp_context: Option<McpContext>,
+    mcp_context: Option<&McpContext>,
 ) -> (Vec<ConnectionCandidate>, usize, bool) {
     let mut candidates = config
         .ordered_profiles()
@@ -2154,7 +2300,6 @@ fn build_candidates(
         .map(|profile| ConnectionCandidate {
             profile,
             source: "saved",
-            preferred_schema: None,
         })
         .collect::<Vec<_>>();
 
@@ -2169,7 +2314,6 @@ fn build_candidates(
                     path: None,
                 },
                 source: "cli",
-                preferred_schema: args.schema.clone(),
             },
         );
     }
@@ -2185,20 +2329,17 @@ fn build_candidates(
                     path: Some(path.clone()),
                 },
                 source: "cli",
-                preferred_schema: None,
             },
         );
     }
 
     if let Some(context) = mcp_context {
-        let preferred_schema = context.preferred_schema.clone();
-        if let Some(profile) = context.into_profile() {
+        if let Some(profile) = context.profile.clone() {
             candidates.insert(
                 0,
                 ConnectionCandidate {
                     profile,
                     source: "mcp",
-                    preferred_schema,
                 },
             );
         }
@@ -2213,10 +2354,49 @@ fn build_candidates(
                 .position(|candidate| candidate.profile.name == *name)
         })
         .unwrap_or(0);
-    let pending_auto_connect =
-        args.profile.is_some() || args.pg_url.is_some() || args.sqlite_path.is_some();
+    let pending_auto_connect = args.profile.is_some()
+        || args.pg_url.is_some()
+        || args.sqlite_path.is_some()
+        || mcp_context
+            .and_then(|context| context.profile.as_ref())
+            .is_some();
 
     (candidates, selected_index, pending_auto_connect)
+}
+
+fn build_startup_target(args: &CliArgs, mcp_context: Option<&McpContext>) -> Option<StartupTarget> {
+    let target = StartupTarget {
+        schema: args
+            .schema
+            .clone()
+            .or_else(|| mcp_context.and_then(|context| context.target_schema.clone())),
+        table: args
+            .table
+            .clone()
+            .or_else(|| mcp_context.and_then(|context| context.target_table.clone())),
+        view: args
+            .view
+            .or_else(|| mcp_context.and_then(|context| context.target_view)),
+    };
+    if target.is_empty() {
+        None
+    } else {
+        Some(target)
+    }
+}
+
+fn startup_view_to_detail_view(view: StartupView) -> DetailView {
+    match view {
+        StartupView::Detail => DetailView::Table,
+        StartupView::Graph => DetailView::Graph,
+    }
+}
+
+fn startup_view_label(view: StartupView) -> &'static str {
+    match view {
+        StartupView::Detail => "detail",
+        StartupView::Graph => "graph",
+    }
 }
 
 fn move_index(current: usize, len: usize, delta: isize) -> usize {
@@ -2372,14 +2552,30 @@ mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
 
+    fn test_args() -> CliArgs {
+        CliArgs {
+            profile: None,
+            pg_url: None,
+            sqlite_path: None,
+            schema: None,
+            table: None,
+            view: None,
+            mcp_context_file: None,
+        }
+    }
+
+    fn test_config() -> ConfigStore {
+        ConfigStore {
+            profiles_path: PathBuf::from("profiles.toml"),
+            state_path: PathBuf::from("state.toml"),
+            file: crate::config::ConfigFile::default(),
+            state: crate::config::StateFile::default(),
+        }
+    }
+
     fn test_app(screen: Screen, search_mode: bool) -> App {
         App {
-            config: ConfigStore {
-                profiles_path: PathBuf::from("profiles.toml"),
-                state_path: PathBuf::from("state.toml"),
-                file: crate::config::ConfigFile::default(),
-                state: crate::config::StateFile::default(),
-            },
+            config: test_config(),
             screen,
             candidates: vec![ConnectionCandidate {
                 profile: ConnectionProfile {
@@ -2389,7 +2585,6 @@ mod tests {
                     path: Some(PathBuf::from("sample.db")),
                 },
                 source: "saved",
-                preferred_schema: None,
             }],
             connection_index: 0,
             schemas: vec!["public".into()],
@@ -2424,6 +2619,21 @@ mod tests {
             status: String::new(),
             example_config: String::new(),
             pending_auto_connect: false,
+            startup_target: None,
+        }
+    }
+
+    fn sample_mcp_context() -> McpContext {
+        McpContext {
+            profile: Some(ConnectionProfile {
+                name: "mcp-sample".into(),
+                kind: DatabaseKind::Sqlite,
+                url: None,
+                path: Some(PathBuf::from("sample/readgrid_demo.db")),
+            }),
+            target_schema: Some("mcp_schema".into()),
+            target_table: Some("mcp_table".into()),
+            target_view: Some(StartupView::Graph),
         }
     }
 
@@ -2529,6 +2739,50 @@ mod tests {
             ],
             indexes: vec![],
         }
+    }
+
+    #[test]
+    fn build_startup_target_prefers_cli_fields_over_mcp() {
+        let mut args = test_args();
+        args.schema = Some("cli_schema".into());
+        args.table = Some("cli_table".into());
+        args.view = Some(StartupView::Detail);
+        let target = build_startup_target(&args, Some(&sample_mcp_context())).unwrap();
+
+        assert_eq!(target.schema.as_deref(), Some("cli_schema"));
+        assert_eq!(target.table.as_deref(), Some("cli_table"));
+        assert_eq!(target.view, Some(StartupView::Detail));
+    }
+
+    #[test]
+    fn build_startup_target_uses_mcp_fields_when_cli_is_missing() {
+        let target = build_startup_target(&test_args(), Some(&sample_mcp_context())).unwrap();
+
+        assert_eq!(target.schema.as_deref(), Some("mcp_schema"));
+        assert_eq!(target.table.as_deref(), Some("mcp_table"));
+        assert_eq!(target.view, Some(StartupView::Graph));
+    }
+
+    #[test]
+    fn build_candidates_auto_connects_for_mcp_profile() {
+        let config = test_config();
+        let (_, _, pending_auto_connect) =
+            build_candidates(&test_args(), &config, Some(&sample_mcp_context()));
+
+        assert!(pending_auto_connect);
+    }
+
+    #[test]
+    fn app_new_rejects_profile_and_direct_connection_mix() {
+        let mut args = test_args();
+        args.profile = Some("saved".into());
+        args.sqlite_path = Some(PathBuf::from("sample/readgrid_demo.db"));
+
+        let error = App::new(args, test_config(), None).err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            "use either --profile or a direct connection target, not both"
+        );
     }
 
     fn line_text(line: &Line<'_>) -> String {
@@ -3434,5 +3688,163 @@ mod tests {
         assert_eq!(app.detail.as_ref().unwrap().table.name, "projects");
         assert_eq!(app.relation_graph.as_ref().unwrap().center.name, "projects");
         assert_eq!(app.graph_center_scroll, 0);
+    }
+
+    #[tokio::test]
+    async fn startup_target_selects_sqlite_table_in_browser() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("sample")
+            .join("readgrid_demo.db");
+        let session = Session::connect(&ConnectionProfile {
+            name: "sample".into(),
+            kind: DatabaseKind::Sqlite,
+            url: None,
+            path: Some(path),
+        })
+        .await
+        .unwrap();
+
+        let mut app = test_app(Screen::Browser, false);
+        app.session = Some(session);
+        app.startup_target = Some(StartupTarget {
+            schema: Some("ignored".into()),
+            table: Some("tasks".into()),
+            view: None,
+        });
+
+        app.load_tables(None).await.unwrap();
+        app.screen = Screen::Browser;
+        app.continue_startup_after_table_load().await.unwrap();
+
+        assert_eq!(app.selected_table().unwrap().name, "tasks");
+        assert!(app.detail.is_none());
+        assert!(app.startup_target.is_none());
+        assert_eq!(app.status, "Selected startup table tasks.");
+    }
+
+    #[tokio::test]
+    async fn startup_target_opens_sqlite_detail_view() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("sample")
+            .join("readgrid_demo.db");
+        let session = Session::connect(&ConnectionProfile {
+            name: "sample".into(),
+            kind: DatabaseKind::Sqlite,
+            url: None,
+            path: Some(path),
+        })
+        .await
+        .unwrap();
+
+        let mut app = test_app(Screen::Browser, false);
+        app.session = Some(session);
+        app.startup_target = Some(StartupTarget {
+            schema: None,
+            table: Some("tasks".into()),
+            view: Some(StartupView::Detail),
+        });
+
+        app.load_tables(None).await.unwrap();
+        app.screen = Screen::Browser;
+        app.continue_startup_after_table_load().await.unwrap();
+
+        assert_eq!(app.screen, Screen::Detail);
+        assert_eq!(app.detail.as_ref().unwrap().table.name, "tasks");
+        assert_eq!(app.detail_view, DetailView::Table);
+        assert!(app.startup_target.is_none());
+        assert_eq!(app.status, "Opened tasks in detail view.");
+    }
+
+    #[tokio::test]
+    async fn startup_target_opens_sqlite_graph_view() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("sample")
+            .join("readgrid_demo.db");
+        let session = Session::connect(&ConnectionProfile {
+            name: "sample".into(),
+            kind: DatabaseKind::Sqlite,
+            url: None,
+            path: Some(path),
+        })
+        .await
+        .unwrap();
+
+        let mut app = test_app(Screen::Browser, false);
+        app.session = Some(session);
+        app.startup_target = Some(StartupTarget {
+            schema: None,
+            table: Some("tasks".into()),
+            view: Some(StartupView::Graph),
+        });
+
+        app.load_tables(None).await.unwrap();
+        app.screen = Screen::Browser;
+        app.continue_startup_after_table_load().await.unwrap();
+
+        assert_eq!(app.screen, Screen::Detail);
+        assert_eq!(app.detail.as_ref().unwrap().table.name, "tasks");
+        assert_eq!(app.detail_view, DetailView::Graph);
+        assert!(app.relation_graph.is_some());
+        assert!(app.startup_target.is_none());
+        assert_eq!(app.status, "Opened tasks in graph view.");
+    }
+
+    #[tokio::test]
+    async fn startup_target_invalid_schema_keeps_remaining_target_pending() {
+        let mut app = test_app(Screen::Schemas, false);
+        app.schemas = vec!["public".into()];
+        app.startup_target = Some(StartupTarget {
+            schema: Some("missing".into()),
+            table: Some("tasks".into()),
+            view: Some(StartupView::Detail),
+        });
+
+        app.continue_startup_after_connect().await.unwrap();
+
+        assert_eq!(
+            app.status,
+            "Schema 'missing' was not found. Choose a schema to continue."
+        );
+        assert_eq!(app.startup_target.as_ref().unwrap().schema, None);
+        assert_eq!(
+            app.startup_target.as_ref().unwrap().table.as_deref(),
+            Some("tasks")
+        );
+        assert_eq!(
+            app.startup_target.as_ref().unwrap().view,
+            Some(StartupView::Detail)
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_view_without_table_falls_back_in_browser() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("sample")
+            .join("readgrid_demo.db");
+        let session = Session::connect(&ConnectionProfile {
+            name: "sample".into(),
+            kind: DatabaseKind::Sqlite,
+            url: None,
+            path: Some(path),
+        })
+        .await
+        .unwrap();
+
+        let mut app = test_app(Screen::Browser, false);
+        app.session = Some(session);
+        app.startup_target = Some(StartupTarget {
+            schema: None,
+            table: None,
+            view: Some(StartupView::Graph),
+        });
+
+        app.load_tables(None).await.unwrap();
+        app.screen = Screen::Browser;
+        app.continue_startup_after_table_load().await.unwrap();
+
+        assert_eq!(app.screen, Screen::Browser);
+        assert!(app.detail.is_none());
+        assert!(app.startup_target.is_none());
+        assert_eq!(app.status, "Startup view 'graph' requires a target table.");
     }
 }
