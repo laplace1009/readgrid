@@ -1,4 +1,9 @@
-use std::{io::Stdout, path::PathBuf, time::Duration};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    io::Stdout,
+    path::PathBuf,
+    time::Duration,
+};
 
 use anyhow::{Result, anyhow};
 use clap::{Parser, ValueEnum};
@@ -25,8 +30,8 @@ use crate::{
         ConnectionProfile, DataPreview, DatabaseKind, DrillThroughAction, ExportFormat,
         ExportRequest, ExportScope, ExportSummary, FilterOperator, ForeignKeyMeta,
         InvestigationSource, InvestigationState, PreviewFilter, RelationGraph, RelationNode,
-        RelationNodeRole, Session, SortState, TableDetail, TableRef, build_drill_through_actions,
-        write_preview_export,
+        RelationNodeRole, RelationshipDirection, Session, SortState, TableDetail, TableRef,
+        build_drill_through_actions, write_preview_export,
     },
     mcp::McpContext,
 };
@@ -57,6 +62,7 @@ pub struct CliArgs {
 pub enum StartupView {
     Detail,
     Graph,
+    Erd,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +77,29 @@ enum Screen {
 enum DetailView {
     Table,
     Graph,
+    Erd,
+}
+
+impl DetailView {
+    fn is_relation(self) -> bool {
+        matches!(self, Self::Graph | Self::Erd)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Table => "detail",
+            Self::Graph => "graph",
+            Self::Erd => "erd",
+        }
+    }
+
+    fn toggle_key(self) -> Option<char> {
+        match self {
+            Self::Table => None,
+            Self::Graph => Some('g'),
+            Self::Erd => Some('d'),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +107,35 @@ enum GraphLane {
     Incoming,
     Center,
     Outgoing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ErdEdge {
+    source_table: TableRef,
+    target_table: TableRef,
+}
+
+#[derive(Debug, Clone)]
+struct ErdGraph {
+    focus: TableRef,
+    tables: Vec<TableRef>,
+    edges: Vec<ErdEdge>,
+}
+
+#[derive(Debug, Clone)]
+struct ErdNodePlacement {
+    table: TableRef,
+    x: usize,
+    y: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ErdLayout {
+    width: usize,
+    height: usize,
+    nodes: Vec<ErdNodePlacement>,
+    edges: Vec<ErdEdge>,
+    focus_order: Vec<TableRef>,
 }
 
 #[derive(Debug, Clone)]
@@ -274,9 +332,13 @@ pub struct App {
     detail_drill_index: usize,
     detail_nav_stack: Vec<DetailNavStackEntry>,
     relation_graph: Option<RelationGraph>,
+    erd_graph: Option<ErdGraph>,
     graph_lane: GraphLane,
     graph_index: usize,
     graph_center_scroll: usize,
+    erd_focus_index: usize,
+    erd_viewport_x: usize,
+    erd_viewport_y: usize,
     preview: Option<DataPreview>,
     preview_row_index: usize,
     sort_index: usize,
@@ -347,9 +409,13 @@ impl App {
             detail_drill_index: 0,
             detail_nav_stack: Vec::new(),
             relation_graph: None,
+            erd_graph: None,
             graph_lane: GraphLane::Center,
             graph_index: 0,
             graph_center_scroll: 0,
+            erd_focus_index: 0,
+            erd_viewport_x: 0,
+            erd_viewport_y: 0,
             preview: None,
             preview_row_index: 0,
             sort_index: 0,
@@ -476,8 +542,8 @@ impl App {
             return Ok(false);
         }
 
-        if self.detail_view == DetailView::Graph {
-            return self.handle_graph_key(key).await;
+        if self.detail_view.is_relation() {
+            return self.handle_relation_view_key(key).await;
         }
 
         if self.detail_export_prompt.is_some() {
@@ -508,7 +574,10 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.move_preview_row(1),
             KeyCode::Enter => self.start_detail_drill_prompt(),
             KeyCode::Char('g') => {
-                self.enter_graph_view().await?;
+                self.enter_relation_view(DetailView::Graph).await?;
+            }
+            KeyCode::Char('d') => {
+                self.enter_relation_view(DetailView::Erd).await?;
             }
             KeyCode::Char('b') => self.start_workspace_prompt(),
             KeyCode::Char('e') => self.start_detail_export_prompt(),
@@ -577,30 +646,67 @@ impl App {
         Ok(false)
     }
 
-    async fn handle_graph_key(&mut self, key: KeyEvent) -> Result<bool> {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('g') => {
-                self.detail_view = DetailView::Table;
-                self.status = "Returned to table detail.".into();
-            }
-            KeyCode::Left | KeyCode::Char('h') => self.move_graph_lane(-1),
-            KeyCode::Right | KeyCode::Char('l') => self.move_graph_lane(1),
-            KeyCode::Up | KeyCode::Char('k') => self.move_graph_row(-1),
-            KeyCode::Down | KeyCode::Char('j') => self.move_graph_row(1),
-            KeyCode::Char('r') => {
-                self.reload_relation_graph().await?;
-                self.status = "Reloaded relationship graph.".into();
-            }
-            KeyCode::Char('b') => self.start_workspace_prompt(),
-            KeyCode::Enter => {
-                if self.graph_lane == GraphLane::Center {
-                    self.status = "Already centered on the current table.".into();
-                } else if let Some(table) = self.focused_graph_table() {
-                    self.load_table_detail(table, DetailView::Graph).await?;
-                    self.status = "Centered relationship graph on selected table.".into();
+    async fn handle_relation_view_key(&mut self, key: KeyEvent) -> Result<bool> {
+        let detail_view = self.detail_view;
+        if key.code == KeyCode::Esc
+            || detail_view
+                .toggle_key()
+                .map(|toggle| key.code == KeyCode::Char(toggle))
+                .unwrap_or(false)
+        {
+            self.detail_view = DetailView::Table;
+            self.status = "Returned to table detail.".into();
+            return Ok(false);
+        }
+
+        match detail_view {
+            DetailView::Graph => match key.code {
+                KeyCode::Left | KeyCode::Char('h') => self.move_graph_lane(-1),
+                KeyCode::Right | KeyCode::Char('l') => self.move_graph_lane(1),
+                KeyCode::Up | KeyCode::Char('k') => self.move_graph_row(-1),
+                KeyCode::Down | KeyCode::Char('j') => self.move_graph_row(1),
+                KeyCode::Char('r') => {
+                    self.reload_relation_graph().await?;
+                    self.status = format!("Reloaded {} view.", detail_view.label());
                 }
-            }
-            _ => {}
+                KeyCode::Char('b') => self.start_workspace_prompt(),
+                KeyCode::Enter => {
+                    if self.graph_lane == GraphLane::Center {
+                        self.status = "Already centered on the current table.".into();
+                    } else if let Some(table) = self.focused_graph_table() {
+                        self.load_table_detail(table, detail_view).await?;
+                        self.status =
+                            format!("Centered {} on selected table.", detail_view.label());
+                    }
+                }
+                _ => {}
+            },
+            DetailView::Erd => match key.code {
+                KeyCode::Left => self.move_erd_focus_in_direction(-1, 0),
+                KeyCode::Right => self.move_erd_focus_in_direction(1, 0),
+                KeyCode::Up => self.move_erd_focus_in_direction(0, -1),
+                KeyCode::Down => self.move_erd_focus_in_direction(0, 1),
+                KeyCode::Char('h') => self.move_erd_viewport(-1, 0),
+                KeyCode::Char('l') => self.move_erd_viewport(1, 0),
+                KeyCode::Char('k') => self.move_erd_viewport(0, -1),
+                KeyCode::Char('j') => self.move_erd_viewport(0, 1),
+                KeyCode::Tab => self.cycle_erd_focus(1),
+                KeyCode::BackTab => self.cycle_erd_focus(-1),
+                KeyCode::Char('c') => self.recenter_erd_viewport(),
+                KeyCode::Char('r') => {
+                    self.reload_erd_graph().await?;
+                    self.status = "Reloaded erd canvas.".into();
+                }
+                KeyCode::Char('b') => self.start_workspace_prompt(),
+                KeyCode::Enter => {
+                    if let Some(table) = self.erd_focus_table() {
+                        self.load_table_detail(table, DetailView::Table).await?;
+                        self.status = "Opened focused table from erd.".into();
+                    }
+                }
+                _ => {}
+            },
+            DetailView::Table => {}
         }
         Ok(false)
     }
@@ -648,7 +754,7 @@ impl App {
     fn available_workspace_actions(&self) -> Vec<WorkspaceAction> {
         match self.screen {
             Screen::Browser => vec![WorkspaceAction::OpenBookmark],
-            Screen::Detail if self.detail_view == DetailView::Graph => {
+            Screen::Detail if self.detail_view.is_relation() => {
                 vec![WorkspaceAction::SaveBookmark, WorkspaceAction::OpenBookmark]
             }
             Screen::Detail => vec![
@@ -1792,9 +1898,13 @@ impl App {
         self.detail_drill_index = 0;
         self.detail_nav_stack.clear();
         self.relation_graph = None;
+        self.erd_graph = None;
         self.graph_lane = GraphLane::Center;
         self.graph_index = 0;
         self.graph_center_scroll = 0;
+        self.erd_focus_index = 0;
+        self.erd_viewport_x = 0;
+        self.erd_viewport_y = 0;
         self.preview = None;
         self.preview_row_index = 0;
         self.sort_index = 0;
@@ -1910,6 +2020,10 @@ impl App {
         self.graph_index = 0;
         self.graph_center_scroll = 0;
         self.relation_graph = None;
+        self.erd_graph = None;
+        self.erd_focus_index = 0;
+        self.erd_viewport_x = 0;
+        self.erd_viewport_y = 0;
         self.preview = Some(DataPreview {
             columns: Vec::new(),
             rows: Vec::new(),
@@ -1918,8 +2032,10 @@ impl App {
         });
         self.preview_row_index = context.selected_row;
         self.reload_preview().await?;
-        if detail_view == DetailView::Graph {
-            self.reload_relation_graph().await?;
+        match detail_view {
+            DetailView::Graph => self.reload_relation_graph().await?,
+            DetailView::Erd => self.reload_erd_graph().await?,
+            DetailView::Table => {}
         }
         self.screen = Screen::Detail;
         Ok(())
@@ -1952,16 +2068,82 @@ impl App {
         Ok(())
     }
 
-    async fn enter_graph_view(&mut self) -> Result<()> {
-        self.detail_view = DetailView::Graph;
-        if self.relation_graph.is_none() {
-            self.reload_relation_graph().await?;
-        } else {
-            self.graph_lane = GraphLane::Center;
-            self.graph_index = 0;
-            self.graph_center_scroll = 0;
+    async fn reload_erd_graph(&mut self) -> Result<()> {
+        let focus = self
+            .detail
+            .as_ref()
+            .map(|detail| detail.table.clone())
+            .ok_or_else(|| anyhow!("no table detail is loaded"))?;
+        let session = self.session().ok_or_else(|| anyhow!("no active session"))?;
+        let schema = match session.kind() {
+            DatabaseKind::Postgres => focus.schema.as_deref(),
+            DatabaseKind::Sqlite => None,
+        };
+        let mut tables = session.list_tables(schema).await?;
+        tables.sort_by_key(TableRef::display_name);
+        let in_scope = tables.iter().cloned().collect::<HashSet<_>>();
+        let mut edge_set = HashSet::new();
+
+        for table in &tables {
+            let detail = session.load_detail(table).await?;
+            for foreign_key in detail.foreign_keys {
+                if foreign_key.direction == RelationshipDirection::Outgoing
+                    && in_scope.contains(&foreign_key.to_table)
+                {
+                    edge_set.insert(ErdEdge {
+                        source_table: detail.table.clone(),
+                        target_table: foreign_key.to_table,
+                    });
+                }
+            }
         }
-        self.status = "Viewing relationship graph.".into();
+
+        let mut edges = edge_set.into_iter().collect::<Vec<_>>();
+        edges.sort_by_key(|edge| {
+            (
+                edge.source_table.display_name(),
+                edge.target_table.display_name(),
+            )
+        });
+
+        self.erd_graph = Some(ErdGraph {
+            focus: focus.clone(),
+            tables,
+            edges,
+        });
+        self.erd_focus_index = self
+            .erd_graph
+            .as_ref()
+            .and_then(|graph| graph.tables.iter().position(|table| *table == focus))
+            .unwrap_or(0);
+        self.erd_viewport_x = 0;
+        self.erd_viewport_y = 0;
+        self.recenter_erd_viewport();
+        Ok(())
+    }
+
+    async fn enter_relation_view(&mut self, detail_view: DetailView) -> Result<()> {
+        self.detail_view = detail_view;
+        match detail_view {
+            DetailView::Graph => {
+                if self.relation_graph.is_none() {
+                    self.reload_relation_graph().await?;
+                } else {
+                    self.graph_lane = GraphLane::Center;
+                    self.graph_index = 0;
+                    self.graph_center_scroll = 0;
+                }
+            }
+            DetailView::Erd => {
+                if self.erd_graph.is_none() {
+                    self.reload_erd_graph().await?;
+                } else {
+                    self.recenter_erd_viewport();
+                }
+            }
+            DetailView::Table => {}
+        }
+        self.status = format!("Viewing {}.", detail_view.label());
         Ok(())
     }
 
@@ -2121,6 +2303,7 @@ impl App {
         match self.detail_view {
             DetailView::Table => StartupView::Detail,
             DetailView::Graph => StartupView::Graph,
+            DetailView::Erd => StartupView::Erd,
         }
     }
 
@@ -2189,6 +2372,9 @@ impl App {
             }
             Screen::Detail if self.detail_view == DetailView::Graph => {
                 "Left/Right lane | Up/Down move-or-scroll | Enter center neighbor | b workspace | g/Esc detail | r reload | q quit"
+            }
+            Screen::Detail if self.detail_view == DetailView::Erd => {
+                "Arrow keys focus | h/j/k/l pan | Tab cycle | Enter open table | c center | b workspace | d/Esc detail | r reload | q quit"
             }
             Screen::Detail
                 if matches!(
@@ -2372,8 +2558,12 @@ impl App {
             }
         };
 
-        if self.detail_view == DetailView::Graph {
-            self.render_graph_detail(frame, chunks[0], detail);
+        if self.detail_view.is_relation() {
+            match self.detail_view {
+                DetailView::Graph => self.render_graph_detail(frame, chunks[0], detail),
+                DetailView::Erd => self.render_erd_detail(frame, chunks[0], detail),
+                DetailView::Table => {}
+            }
             if let Some(prompt) = &self.workspace_prompt {
                 self.render_workspace_prompt(frame, chunks[0], prompt);
             }
@@ -2800,6 +2990,164 @@ impl App {
         self.session.as_ref().map(|session| session.kind())
     }
 
+    fn erd_focus_table(&self) -> Option<TableRef> {
+        self.erd_graph
+            .as_ref()
+            .and_then(|graph| graph.tables.get(self.erd_focus_index))
+            .cloned()
+    }
+
+    fn current_erd_layout(&self) -> Option<ErdLayout> {
+        self.erd_graph.as_ref().map(build_erd_layout)
+    }
+
+    fn erd_viewport_size(&self) -> (usize, usize) {
+        terminal::size()
+            .ok()
+            .map(|(width, height)| {
+                (
+                    width.saturating_sub(2).max(1) as usize,
+                    height.saturating_sub(3).max(1) as usize,
+                )
+            })
+            .unwrap_or((1, 1))
+    }
+
+    fn clamp_erd_viewport(&mut self) {
+        let Some(layout) = self.current_erd_layout() else {
+            return;
+        };
+        let (viewport_width, viewport_height) = self.erd_viewport_size();
+        self.erd_viewport_x = self
+            .erd_viewport_x
+            .min(layout.width.saturating_sub(viewport_width));
+        self.erd_viewport_y = self
+            .erd_viewport_y
+            .min(layout.height.saturating_sub(viewport_height));
+    }
+
+    fn recenter_erd_viewport(&mut self) {
+        let Some(layout) = self.current_erd_layout() else {
+            return;
+        };
+        let Some(focus) = self.erd_focus_table() else {
+            return;
+        };
+        let Some(node) = layout.nodes.iter().find(|node| node.table == focus) else {
+            return;
+        };
+        let (viewport_width, viewport_height) = self.erd_viewport_size();
+        let focus_x = node.x + erd_box_width() / 2;
+        let focus_y = node.y + 1;
+        self.erd_viewport_x = focus_x.saturating_sub(viewport_width / 2);
+        self.erd_viewport_y = focus_y.saturating_sub(viewport_height / 2);
+        self.clamp_erd_viewport();
+    }
+
+    fn move_erd_viewport(&mut self, dx: isize, dy: isize) {
+        let step_x = 6;
+        let step_y = 3;
+        self.erd_viewport_x = apply_signed_delta(self.erd_viewport_x, dx * step_x);
+        self.erd_viewport_y = apply_signed_delta(self.erd_viewport_y, dy * step_y);
+        self.clamp_erd_viewport();
+    }
+
+    fn cycle_erd_focus(&mut self, delta: isize) {
+        let Some(layout) = self.current_erd_layout() else {
+            return;
+        };
+        let Some(current) = self.erd_focus_table() else {
+            return;
+        };
+        let Some(current_index) = layout
+            .focus_order
+            .iter()
+            .position(|table| *table == current)
+        else {
+            return;
+        };
+        let next_index = move_index(current_index, layout.focus_order.len(), delta);
+        let Some(next_table) = layout.focus_order.get(next_index) else {
+            return;
+        };
+        if let Some(graph) = &self.erd_graph {
+            self.erd_focus_index = graph
+                .tables
+                .iter()
+                .position(|table| table == next_table)
+                .unwrap_or(self.erd_focus_index);
+        }
+        self.recenter_erd_viewport();
+    }
+
+    fn move_erd_focus_in_direction(&mut self, dx: isize, dy: isize) {
+        let Some(layout) = self.current_erd_layout() else {
+            return;
+        };
+        let Some(current) = self.erd_focus_table() else {
+            return;
+        };
+        let Some(current_node) = layout.nodes.iter().find(|node| node.table == current) else {
+            return;
+        };
+
+        let mut best: Option<(&ErdNodePlacement, usize, usize)> = None;
+
+        for candidate in &layout.nodes {
+            if candidate.table == current {
+                continue;
+            }
+
+            let delta_x = candidate.x as isize - current_node.x as isize;
+            let delta_y = candidate.y as isize - current_node.y as isize;
+
+            let matches_direction = match (dx, dy) {
+                (-1, 0) => delta_x < 0,
+                (1, 0) => delta_x > 0,
+                (0, -1) => delta_y < 0,
+                (0, 1) => delta_y > 0,
+                _ => false,
+            };
+            if !matches_direction {
+                continue;
+            }
+
+            let primary_distance = if dx != 0 {
+                delta_x.unsigned_abs()
+            } else {
+                delta_y.unsigned_abs()
+            };
+            let secondary_distance = if dx != 0 {
+                delta_y.unsigned_abs()
+            } else {
+                delta_x.unsigned_abs()
+            };
+
+            let should_replace = best
+                .as_ref()
+                .map(|(_, best_primary, best_secondary)| {
+                    (primary_distance, secondary_distance) < (*best_primary, *best_secondary)
+                })
+                .unwrap_or(true);
+
+            if should_replace {
+                best = Some((candidate, primary_distance, secondary_distance));
+            }
+        }
+
+        let Some((target, _, _)) = best else {
+            return;
+        };
+
+        if let Some(graph) = &self.erd_graph {
+            if let Some(index) = graph.tables.iter().position(|table| table == &target.table) {
+                self.erd_focus_index = index;
+                self.recenter_erd_viewport();
+                self.status = format!("Focused {} in erd.", target.table.display_name());
+            }
+        }
+    }
+
     fn graph_lane_nodes(&self, lane: GraphLane) -> Vec<&RelationNode> {
         self.relation_graph
             .as_ref()
@@ -2823,18 +3171,20 @@ impl App {
 
     fn move_graph_row(&mut self, delta: isize) {
         if self.graph_lane == GraphLane::Center {
-            let len = self
-                .detail
-                .as_ref()
-                .map(|detail| detail.columns.len())
-                .unwrap_or(0);
-            let visible_rows = self.graph_center_visible_rows();
-            let max_scroll = len.saturating_sub(visible_rows);
-            self.graph_center_scroll = move_index(
-                self.graph_center_scroll,
-                max_scroll.saturating_add(1),
-                delta,
-            );
+            if self.detail_view == DetailView::Graph {
+                let len = self
+                    .detail
+                    .as_ref()
+                    .map(|detail| detail.columns.len())
+                    .unwrap_or(0);
+                let visible_rows = self.graph_center_visible_rows();
+                let max_scroll = len.saturating_sub(visible_rows);
+                self.graph_center_scroll = move_index(
+                    self.graph_center_scroll,
+                    max_scroll.saturating_add(1),
+                    delta,
+                );
+            }
         } else {
             self.graph_index = move_index(
                 self.graph_index,
@@ -2978,6 +3328,57 @@ impl App {
                 .block(Block::default().title("Connections").borders(Borders::ALL))
                 .wrap(Wrap { trim: false }),
             sections[1],
+        );
+    }
+
+    fn render_erd_detail(&self, frame: &mut Frame, area: Rect, detail: &TableDetail) {
+        let Some(graph) = &self.erd_graph else {
+            let loading = Paragraph::new("Loading ERD view...")
+                .block(Block::default().title("ERD").borders(Borders::ALL));
+            frame.render_widget(loading, area);
+            return;
+        };
+
+        if area.width < (erd_box_width() + 4) as u16 || area.height < 6 {
+            let warning =
+                Paragraph::new("Terminal too small for the ERD canvas. Enlarge the window.")
+                    .block(
+                        Block::default()
+                            .title(format!("ERD (focus: {})", detail.table.display_name()))
+                            .borders(Borders::ALL),
+                    )
+                    .wrap(Wrap { trim: false });
+            frame.render_widget(warning, area);
+            return;
+        }
+
+        let layout = build_erd_layout(graph);
+        let viewport_width = area.width.saturating_sub(2) as usize;
+        let viewport_height = area.height.saturating_sub(2) as usize;
+        let lines = erd_viewport_lines(
+            &layout,
+            self.erd_focus_table().as_ref(),
+            self.erd_viewport_x,
+            self.erd_viewport_y,
+            viewport_width,
+            viewport_height,
+        );
+
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(
+                    Block::default()
+                        .title(format!(
+                            "ERD (anchor: {}, selected: {})",
+                            graph.focus.display_name(),
+                            self.erd_focus_table()
+                                .unwrap_or_else(|| graph.focus.clone())
+                                .display_name()
+                        ))
+                        .borders(Borders::ALL),
+                )
+                .wrap(Wrap { trim: false }),
+            area,
         );
     }
 
@@ -3270,6 +3671,356 @@ fn graph_lane_title(lane: GraphLane) -> &'static str {
     }
 }
 
+fn erd_box_width() -> usize {
+    22
+}
+
+fn erd_box_inner_width() -> usize {
+    erd_box_width().saturating_sub(4)
+}
+
+fn build_erd_layout(graph: &ErdGraph) -> ErdLayout {
+    let mut undirected = HashMap::<TableRef, Vec<TableRef>>::new();
+    let mut outgoing = HashMap::<TableRef, Vec<TableRef>>::new();
+    let mut incoming = HashMap::<TableRef, Vec<TableRef>>::new();
+
+    for table in &graph.tables {
+        undirected.entry(table.clone()).or_default();
+        outgoing.entry(table.clone()).or_default();
+        incoming.entry(table.clone()).or_default();
+    }
+
+    for edge in &graph.edges {
+        undirected
+            .entry(edge.source_table.clone())
+            .or_default()
+            .push(edge.target_table.clone());
+        undirected
+            .entry(edge.target_table.clone())
+            .or_default()
+            .push(edge.source_table.clone());
+        outgoing
+            .entry(edge.source_table.clone())
+            .or_default()
+            .push(edge.target_table.clone());
+        incoming
+            .entry(edge.target_table.clone())
+            .or_default()
+            .push(edge.source_table.clone());
+    }
+
+    let mut visited = HashSet::new();
+    let mut components = Vec::<Vec<TableRef>>::new();
+    for table in &graph.tables {
+        if visited.contains(table) {
+            continue;
+        }
+        let mut component = Vec::new();
+        let mut queue = VecDeque::from([table.clone()]);
+        visited.insert(table.clone());
+        while let Some(current) = queue.pop_front() {
+            component.push(current.clone());
+            let mut neighbors = undirected.get(&current).cloned().unwrap_or_default();
+            neighbors.sort_by_key(TableRef::display_name);
+            for neighbor in neighbors {
+                if visited.insert(neighbor.clone()) {
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+        component.sort_by_key(TableRef::display_name);
+        components.push(component);
+    }
+
+    components.sort_by_key(|component| {
+        (
+            !component.contains(&graph.focus),
+            component
+                .first()
+                .map(TableRef::display_name)
+                .unwrap_or_default(),
+        )
+    });
+
+    let column_gap = 10;
+    let row_gap = 2;
+    let component_gap = 5;
+    let mut nodes = Vec::new();
+    let mut y_offset = 1usize;
+
+    for component in components {
+        let anchor = if component.contains(&graph.focus) {
+            graph.focus.clone()
+        } else {
+            component
+                .first()
+                .cloned()
+                .unwrap_or_else(|| graph.focus.clone())
+        };
+
+        let component_set = component.iter().cloned().collect::<HashSet<_>>();
+        let mut columns = HashMap::<TableRef, isize>::new();
+        let mut queue = VecDeque::from([anchor.clone()]);
+        columns.insert(anchor.clone(), 0);
+
+        while let Some(current) = queue.pop_front() {
+            let current_column = columns.get(&current).copied().unwrap_or(0);
+
+            let mut next_outgoing = outgoing.get(&current).cloned().unwrap_or_default();
+            next_outgoing.retain(|table| component_set.contains(table));
+            next_outgoing.sort_by_key(TableRef::display_name);
+            for table in next_outgoing {
+                if columns.insert(table.clone(), current_column + 1).is_none() {
+                    queue.push_back(table);
+                }
+            }
+
+            let mut next_incoming = incoming.get(&current).cloned().unwrap_or_default();
+            next_incoming.retain(|table| component_set.contains(table));
+            next_incoming.sort_by_key(TableRef::display_name);
+            for table in next_incoming {
+                if columns.insert(table.clone(), current_column - 1).is_none() {
+                    queue.push_back(table);
+                }
+            }
+        }
+
+        let min_column = columns.values().copied().min().unwrap_or(0);
+        let mut by_column = HashMap::<isize, Vec<TableRef>>::new();
+        for table in component {
+            by_column
+                .entry(columns.get(&table).copied().unwrap_or(0) - min_column)
+                .or_default()
+                .push(table);
+        }
+
+        let mut ordered_columns = by_column.keys().copied().collect::<Vec<_>>();
+        ordered_columns.sort_unstable();
+        let mut component_height = 0usize;
+
+        for column in ordered_columns {
+            let mut tables = by_column.remove(&column).unwrap_or_default();
+            tables.sort_by_key(TableRef::display_name);
+            component_height = component_height.max(tables.len() * (3 + row_gap));
+
+            for (row_index, table) in tables.into_iter().enumerate() {
+                nodes.push(ErdNodePlacement {
+                    table,
+                    x: 2 + column as usize * (erd_box_width() + column_gap),
+                    y: y_offset + row_index * (3 + row_gap),
+                });
+            }
+        }
+
+        y_offset += component_height.max(3) + component_gap;
+    }
+
+    nodes.sort_by_key(|node| (node.y, node.x, node.table.display_name()));
+    let width = nodes
+        .iter()
+        .map(|node| node.x + erd_box_width() + 4)
+        .max()
+        .unwrap_or(erd_box_width() + 4);
+    let height = nodes.iter().map(|node| node.y + 5).max().unwrap_or(5);
+    let focus_order = nodes.iter().map(|node| node.table.clone()).collect();
+
+    ErdLayout {
+        width,
+        height,
+        nodes,
+        edges: graph.edges.clone(),
+        focus_order,
+    }
+}
+
+fn erd_viewport_lines(
+    layout: &ErdLayout,
+    focused_table: Option<&TableRef>,
+    viewport_x: usize,
+    viewport_y: usize,
+    viewport_width: usize,
+    viewport_height: usize,
+) -> Vec<Line<'static>> {
+    let canvas = render_erd_canvas(layout, focused_table);
+    let mut lines = Vec::new();
+
+    for row in viewport_y..viewport_y.saturating_add(viewport_height) {
+        if row >= canvas.len() {
+            lines.push(Line::from(" ".repeat(viewport_width)));
+            continue;
+        }
+
+        let line = canvas[row]
+            .chars()
+            .skip(viewport_x)
+            .take(viewport_width)
+            .collect::<String>();
+        let padded = format!("{line:<viewport_width$}");
+        lines.push(Line::from(padded));
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from(String::new()));
+    }
+
+    lines
+}
+
+fn draw_erd_box(canvas: &mut [Vec<char>], node: &ErdNodePlacement, focused: bool) {
+    let label = if focused {
+        truncate_for_box(
+            &format!("> {} <", node.table.display_name()),
+            erd_box_inner_width(),
+        )
+    } else {
+        truncate_for_box(&node.table.display_name(), erd_box_inner_width())
+    };
+
+    let lines = if focused {
+        vec![
+            format!("#{}#", "=".repeat(erd_box_width() - 2)),
+            format!("! {:<width$} !", label, width = erd_box_inner_width()),
+            format!("#{}#", "=".repeat(erd_box_width() - 2)),
+        ]
+    } else {
+        vec![
+            format!("+{}+", "-".repeat(erd_box_width() - 2)),
+            format!("| {:<width$} |", label, width = erd_box_inner_width()),
+            format!("+{}+", "-".repeat(erd_box_width() - 2)),
+        ]
+    };
+
+    for (offset, line) in lines.into_iter().enumerate() {
+        for (index, ch) in line.chars().enumerate() {
+            write_canvas_char(canvas, node.x + index, node.y + offset, ch);
+        }
+    }
+}
+
+fn render_erd_canvas(layout: &ErdLayout, focused_table: Option<&TableRef>) -> Vec<String> {
+    let mut canvas = vec![vec![' '; layout.width.max(1)]; layout.height.max(1)];
+    let node_lookup = layout
+        .nodes
+        .iter()
+        .map(|node| (node.table.clone(), node.clone()))
+        .collect::<HashMap<_, _>>();
+
+    for edge in &layout.edges {
+        let Some(source) = node_lookup.get(&edge.source_table) else {
+            continue;
+        };
+        let Some(target) = node_lookup.get(&edge.target_table) else {
+            continue;
+        };
+        draw_erd_edge(&mut canvas, source, target);
+    }
+
+    for node in &layout.nodes {
+        let is_focused = focused_table
+            .map(|table| table == &node.table)
+            .unwrap_or(false);
+        if !is_focused {
+            draw_erd_box(&mut canvas, node, false);
+        }
+    }
+
+    if let Some(focused) = focused_table {
+        if let Some(node) = node_lookup.get(focused) {
+            draw_erd_box(&mut canvas, node, true);
+        }
+    }
+
+    canvas
+        .into_iter()
+        .map(|row| row.into_iter().collect::<String>())
+        .collect()
+}
+
+fn draw_erd_edge(canvas: &mut [Vec<char>], source: &ErdNodePlacement, target: &ErdNodePlacement) {
+    let source_y = source.y + 1;
+    let target_y = target.y + 1;
+
+    if source.x == target.x {
+        let start_x = source.x + erd_box_width();
+        let end_x = target.x + erd_box_width();
+        let mid_x = source.x + erd_box_width() + 3;
+        draw_horizontal(canvas, start_x, mid_x, source_y);
+        draw_vertical(canvas, mid_x, source_y, target_y);
+        draw_horizontal(canvas, end_x, mid_x, target_y);
+        write_canvas_char(canvas, end_x, target_y, '<');
+        return;
+    }
+
+    if source.x < target.x {
+        let start_x = source.x + erd_box_width();
+        let end_x = target.x.saturating_sub(1);
+        let mid_x = ((start_x + end_x) / 2).max(start_x + 1);
+        draw_horizontal(canvas, start_x, mid_x, source_y);
+        draw_vertical(canvas, mid_x, source_y, target_y);
+        draw_horizontal(canvas, mid_x, end_x, target_y);
+        write_canvas_char(canvas, end_x, target_y, '>');
+    } else {
+        let start_x = source.x.saturating_sub(1);
+        let end_x = target.x + erd_box_width();
+        let mid_x = ((end_x + start_x) / 2).max(end_x + 1);
+        draw_horizontal(canvas, mid_x, start_x, source_y);
+        draw_vertical(canvas, mid_x, source_y, target_y);
+        draw_horizontal(canvas, end_x, mid_x, target_y);
+        write_canvas_char(canvas, end_x, target_y, '<');
+    }
+}
+
+fn draw_horizontal(canvas: &mut [Vec<char>], start_x: usize, end_x: usize, y: usize) {
+    let (from, to) = if start_x <= end_x {
+        (start_x, end_x)
+    } else {
+        (end_x, start_x)
+    };
+    for x in from..=to {
+        merge_canvas_char(canvas, x, y, '-');
+    }
+}
+
+fn draw_vertical(canvas: &mut [Vec<char>], x: usize, start_y: usize, end_y: usize) {
+    let (from, to) = if start_y <= end_y {
+        (start_y, end_y)
+    } else {
+        (end_y, start_y)
+    };
+    for y in from..=to {
+        merge_canvas_char(canvas, x, y, '|');
+    }
+}
+
+fn merge_canvas_char(canvas: &mut [Vec<char>], x: usize, y: usize, ch: char) {
+    if y >= canvas.len() || x >= canvas[y].len() {
+        return;
+    }
+
+    let current = canvas[y][x];
+    canvas[y][x] = match (current, ch) {
+        (' ', new_char) => new_char,
+        ('-', '|') | ('|', '-') | ('+', _) | (_, '+') => '+',
+        (existing, _) if existing == ch => existing,
+        (_, new_char) => new_char,
+    };
+}
+
+fn write_canvas_char(canvas: &mut [Vec<char>], x: usize, y: usize, ch: char) {
+    if y >= canvas.len() || x >= canvas[y].len() {
+        return;
+    }
+    canvas[y][x] = ch;
+}
+
+fn apply_signed_delta(value: usize, delta: isize) -> usize {
+    if delta.is_negative() {
+        value.saturating_sub(delta.unsigned_abs())
+    } else {
+        value.saturating_add(delta as usize)
+    }
+}
+
 fn build_candidates(
     args: &CliArgs,
     config: &ConfigStore,
@@ -3553,6 +4304,7 @@ fn startup_view_to_detail_view(view: StartupView) -> DetailView {
     match view {
         StartupView::Detail => DetailView::Table,
         StartupView::Graph => DetailView::Graph,
+        StartupView::Erd => DetailView::Erd,
     }
 }
 
@@ -3560,6 +4312,7 @@ fn startup_view_label(view: StartupView) -> &'static str {
     match view {
         StartupView::Detail => "detail",
         StartupView::Graph => "graph",
+        StartupView::Erd => "erd",
     }
 }
 
@@ -3779,9 +4532,13 @@ mod tests {
             detail_drill_index: 0,
             detail_nav_stack: Vec::new(),
             relation_graph: None,
+            erd_graph: None,
             graph_lane: GraphLane::Center,
             graph_index: 0,
             graph_center_scroll: 0,
+            erd_focus_index: 0,
+            erd_viewport_x: 0,
+            erd_viewport_y: 0,
             preview: None,
             preview_row_index: 0,
             sort_index: 0,
@@ -3869,6 +4626,142 @@ mod tests {
                 },
             ],
             edges: vec![],
+        }
+    }
+
+    fn sample_erd_graph() -> ErdGraph {
+        ErdGraph {
+            focus: TableRef {
+                schema: None,
+                name: "tasks".into(),
+            },
+            tables: vec![
+                TableRef {
+                    schema: None,
+                    name: "comments".into(),
+                },
+                TableRef {
+                    schema: None,
+                    name: "projects".into(),
+                },
+                TableRef {
+                    schema: None,
+                    name: "tasks".into(),
+                },
+                TableRef {
+                    schema: None,
+                    name: "users".into(),
+                },
+            ],
+            edges: vec![
+                ErdEdge {
+                    source_table: TableRef {
+                        schema: None,
+                        name: "comments".into(),
+                    },
+                    target_table: TableRef {
+                        schema: None,
+                        name: "tasks".into(),
+                    },
+                },
+                ErdEdge {
+                    source_table: TableRef {
+                        schema: None,
+                        name: "tasks".into(),
+                    },
+                    target_table: TableRef {
+                        schema: None,
+                        name: "projects".into(),
+                    },
+                },
+                ErdEdge {
+                    source_table: TableRef {
+                        schema: None,
+                        name: "tasks".into(),
+                    },
+                    target_table: TableRef {
+                        schema: None,
+                        name: "users".into(),
+                    },
+                },
+            ],
+        }
+    }
+
+    fn sample_tall_erd_graph() -> ErdGraph {
+        ErdGraph {
+            focus: TableRef {
+                schema: None,
+                name: "tasks".into(),
+            },
+            tables: vec![
+                TableRef {
+                    schema: None,
+                    name: "audit_entries".into(),
+                },
+                TableRef {
+                    schema: None,
+                    name: "comments".into(),
+                },
+                TableRef {
+                    schema: None,
+                    name: "projects".into(),
+                },
+                TableRef {
+                    schema: None,
+                    name: "tasks".into(),
+                },
+                TableRef {
+                    schema: None,
+                    name: "users".into(),
+                },
+                TableRef {
+                    schema: None,
+                    name: "work_logs".into(),
+                },
+            ],
+            edges: vec![
+                ErdEdge {
+                    source_table: TableRef {
+                        schema: None,
+                        name: "comments".into(),
+                    },
+                    target_table: TableRef {
+                        schema: None,
+                        name: "tasks".into(),
+                    },
+                },
+                ErdEdge {
+                    source_table: TableRef {
+                        schema: None,
+                        name: "tasks".into(),
+                    },
+                    target_table: TableRef {
+                        schema: None,
+                        name: "projects".into(),
+                    },
+                },
+                ErdEdge {
+                    source_table: TableRef {
+                        schema: None,
+                        name: "tasks".into(),
+                    },
+                    target_table: TableRef {
+                        schema: None,
+                        name: "users".into(),
+                    },
+                },
+                ErdEdge {
+                    source_table: TableRef {
+                        schema: None,
+                        name: "work_logs".into(),
+                    },
+                    target_table: TableRef {
+                        schema: None,
+                        name: "tasks".into(),
+                    },
+                },
+            ],
         }
     }
 
@@ -3962,6 +4855,19 @@ mod tests {
         assert_eq!(target.schema.as_deref(), Some("mcp_schema"));
         assert_eq!(target.table.as_deref(), Some("mcp_table"));
         assert_eq!(target.view, Some(StartupView::Graph));
+    }
+
+    #[test]
+    fn build_startup_target_accepts_erd_view_from_mcp() {
+        let context = McpContext {
+            target_view: Some(StartupView::Erd),
+            ..sample_mcp_context()
+        };
+        let target =
+            build_startup_target(&test_args(), Some(&context), &BookmarkDefaults::default())
+                .unwrap();
+
+        assert_eq!(target.view, Some(StartupView::Erd));
     }
 
     #[test]
@@ -4205,6 +5111,29 @@ mod tests {
     }
 
     #[test]
+    fn build_erd_layout_places_focus_component_in_multiple_columns() {
+        let layout = build_erd_layout(&sample_erd_graph());
+        let tasks = layout
+            .nodes
+            .iter()
+            .find(|node| node.table.name == "tasks")
+            .unwrap();
+        let comments = layout
+            .nodes
+            .iter()
+            .find(|node| node.table.name == "comments")
+            .unwrap();
+        let projects = layout
+            .nodes
+            .iter()
+            .find(|node| node.table.name == "projects")
+            .unwrap();
+
+        assert!(comments.x < tasks.x);
+        assert!(projects.x > tasks.x);
+    }
+
+    #[test]
     fn graph_center_lines_show_type_and_relation_badges() {
         let detail = sample_graph_detail();
 
@@ -4227,6 +5156,42 @@ mod tests {
         assert!(rendered.contains("Columns:"));
         assert!(rendered.contains("project_id : INTEGER [fk-out]"));
         assert!(rendered.contains("owner_id : INTEGER [fk-in] [null]"));
+    }
+
+    #[test]
+    fn render_erd_canvas_draws_boxes_and_arrows_without_columns() {
+        let layout = build_erd_layout(&sample_erd_graph());
+        let rendered = render_erd_canvas(
+            &layout,
+            Some(&TableRef {
+                schema: None,
+                name: "tasks".into(),
+            }),
+        )
+        .join("\n");
+
+        assert!(rendered.contains("comments"));
+        assert!(rendered.contains("tasks"));
+        assert!(rendered.contains("projects"));
+        assert!(rendered.contains('>'));
+        assert!(!rendered.contains("project_id : INTEGER"));
+        assert!(!rendered.contains("[fk-out]"));
+    }
+
+    #[test]
+    fn render_erd_canvas_makes_focused_table_more_visible() {
+        let layout = build_erd_layout(&sample_erd_graph());
+        let rendered = render_erd_canvas(
+            &layout,
+            Some(&TableRef {
+                schema: None,
+                name: "tasks".into(),
+            }),
+        )
+        .join("\n");
+
+        assert!(rendered.contains("#====================#"));
+        assert!(rendered.contains("! > tasks <          !"));
     }
 
     #[test]
@@ -4731,6 +5696,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn save_bookmark_from_erd_persists_erd_view() {
+        let mut app = test_app(Screen::Detail, false);
+        app.config.state_path = temp_state_path("bookmark_save_erd");
+        seed_sample_detail_state(&mut app, 0);
+        app.detail_view = DetailView::Erd;
+        app.active_connection_target = Some(BookmarkConnectionTarget::SavedProfile {
+            name: "sample".into(),
+        });
+
+        app.start_save_bookmark_prompt();
+        app.handle_workspace_prompt_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let bookmark = app.config.find_bookmark("tasks").unwrap();
+        assert_eq!(bookmark.preferred_view, Some(StartupView::Erd));
+        fs::remove_file(&app.config.state_path).ok();
+    }
+
+    #[tokio::test]
     async fn applying_preset_replaces_filters_and_resets_page() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("sample")
@@ -4908,6 +5893,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn d_toggles_to_erd_when_erd_is_cached() {
+        let mut app = test_app(Screen::Detail, false);
+        app.detail = Some(TableDetail {
+            table: TableRef {
+                schema: None,
+                name: "tasks".into(),
+            },
+            columns: vec![],
+            foreign_keys: vec![],
+            indexes: vec![],
+        });
+        app.erd_graph = Some(sample_erd_graph());
+
+        let should_quit = app
+            .handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(!should_quit);
+        assert_eq!(app.detail_view, DetailView::Erd);
+        assert_eq!(app.status, "Viewing erd.");
+    }
+
+    #[tokio::test]
     async fn esc_returns_to_table_mode_from_graph() {
         let mut app = test_app(Screen::Detail, false);
         app.detail = Some(TableDetail {
@@ -4924,6 +5933,31 @@ mod tests {
 
         let should_quit = app
             .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(!should_quit);
+        assert_eq!(app.screen, Screen::Detail);
+        assert_eq!(app.detail_view, DetailView::Table);
+    }
+
+    #[tokio::test]
+    async fn d_returns_to_table_mode_from_erd() {
+        let mut app = test_app(Screen::Detail, false);
+        app.detail = Some(TableDetail {
+            table: TableRef {
+                schema: None,
+                name: "tasks".into(),
+            },
+            columns: vec![],
+            foreign_keys: vec![],
+            indexes: vec![],
+        });
+        app.detail_view = DetailView::Erd;
+        app.erd_graph = Some(sample_erd_graph());
+
+        let should_quit = app
+            .handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
             .await
             .unwrap();
 
@@ -5003,6 +6037,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(app.graph_center_scroll, expected_scroll);
+    }
+
+    #[tokio::test]
+    async fn erd_arrow_keys_move_focus() {
+        let mut app = test_app(Screen::Detail, false);
+        app.detail = Some(sample_graph_detail());
+        app.detail_view = DetailView::Erd;
+        app.erd_graph = Some(sample_erd_graph());
+        app.erd_focus_index = 2;
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert_eq!(app.erd_focus_table().unwrap().name, "projects");
+        assert_eq!(app.status, "Focused projects in erd.");
+    }
+
+    #[tokio::test]
+    async fn erd_hjkl_pan_viewport() {
+        let mut app = test_app(Screen::Detail, false);
+        app.detail = Some(sample_graph_detail());
+        app.detail_view = DetailView::Erd;
+        app.erd_graph = Some(sample_tall_erd_graph());
+        app.erd_viewport_y = 6;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(app.erd_viewport_y < 6);
+    }
+
+    #[tokio::test]
+    async fn erd_tab_cycles_focus() {
+        let mut app = test_app(Screen::Detail, false);
+        app.detail = Some(sample_graph_detail());
+        app.detail_view = DetailView::Erd;
+        app.erd_graph = Some(sample_erd_graph());
+        app.erd_focus_index = 2;
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert_ne!(app.erd_focus_table().unwrap().name, "tasks");
     }
 
     #[tokio::test]
@@ -5394,6 +6474,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_target_opens_sqlite_erd_view() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("sample")
+            .join("readgrid_demo.db");
+        let session = Session::connect(&ConnectionProfile {
+            name: "sample".into(),
+            kind: DatabaseKind::Sqlite,
+            url: None,
+            path: Some(path),
+        })
+        .await
+        .unwrap();
+
+        let mut app = test_app(Screen::Browser, false);
+        app.session = Some(session);
+        app.startup_target = Some(StartupTarget {
+            schema: None,
+            table: Some("tasks".into()),
+            view: Some(StartupView::Erd),
+            filters: Vec::new(),
+            sort: None,
+        });
+
+        app.load_tables(None).await.unwrap();
+        app.screen = Screen::Browser;
+        app.continue_startup_after_table_load().await.unwrap();
+
+        assert_eq!(app.screen, Screen::Detail);
+        assert_eq!(app.detail.as_ref().unwrap().table.name, "tasks");
+        assert_eq!(app.detail_view, DetailView::Erd);
+        assert!(app.erd_graph.is_some());
+        assert!(app.startup_target.is_none());
+        assert_eq!(app.status, "Opened tasks in erd view.");
+    }
+
+    #[tokio::test]
     async fn startup_target_invalid_schema_keeps_remaining_target_pending() {
         let mut app = test_app(Screen::Schemas, false);
         app.schemas = vec!["public".into()];
@@ -5454,5 +6570,39 @@ mod tests {
         assert!(app.detail.is_none());
         assert!(app.startup_target.is_none());
         assert_eq!(app.status, "Startup view 'graph' requires a target table.");
+    }
+
+    #[tokio::test]
+    async fn startup_erd_view_without_table_falls_back_in_browser() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("sample")
+            .join("readgrid_demo.db");
+        let session = Session::connect(&ConnectionProfile {
+            name: "sample".into(),
+            kind: DatabaseKind::Sqlite,
+            url: None,
+            path: Some(path),
+        })
+        .await
+        .unwrap();
+
+        let mut app = test_app(Screen::Browser, false);
+        app.session = Some(session);
+        app.startup_target = Some(StartupTarget {
+            schema: None,
+            table: None,
+            view: Some(StartupView::Erd),
+            filters: Vec::new(),
+            sort: None,
+        });
+
+        app.load_tables(None).await.unwrap();
+        app.screen = Screen::Browser;
+        app.continue_startup_after_table_load().await.unwrap();
+
+        assert_eq!(app.screen, Screen::Browser);
+        assert!(app.detail.is_none());
+        assert!(app.startup_target.is_none());
+        assert_eq!(app.status, "Startup view 'erd' requires a target table.");
     }
 }
