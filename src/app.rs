@@ -80,6 +80,12 @@ enum DetailView {
     Erd,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelationReturnTarget {
+    Detail,
+    Browser,
+}
+
 impl DetailView {
     fn is_relation(self) -> bool {
         matches!(self, Self::Graph | Self::Erd)
@@ -331,6 +337,7 @@ pub struct App {
     detail_drill_actions: Option<Vec<DrillThroughAction>>,
     detail_drill_index: usize,
     detail_nav_stack: Vec<DetailNavStackEntry>,
+    relation_return_target: RelationReturnTarget,
     relation_graph: Option<RelationGraph>,
     erd_graph: Option<ErdGraph>,
     graph_lane: GraphLane,
@@ -408,6 +415,7 @@ impl App {
             detail_drill_actions: None,
             detail_drill_index: 0,
             detail_nav_stack: Vec::new(),
+            relation_return_target: RelationReturnTarget::Detail,
             relation_graph: None,
             erd_graph: None,
             graph_lane: GraphLane::Center,
@@ -520,6 +528,9 @@ impl App {
             }
             KeyCode::Enter => {
                 self.load_selected_table_detail().await?;
+            }
+            KeyCode::Char('d') => {
+                self.open_selected_table_erd().await?;
             }
             KeyCode::Char('b') => self.start_workspace_prompt(),
             KeyCode::Esc => {
@@ -654,8 +665,18 @@ impl App {
                 .map(|toggle| key.code == KeyCode::Char(toggle))
                 .unwrap_or(false)
         {
-            self.detail_view = DetailView::Table;
-            self.status = "Returned to table detail.".into();
+            match self.relation_return_target {
+                RelationReturnTarget::Detail => {
+                    self.detail_view = DetailView::Table;
+                    self.status = "Returned to table detail.".into();
+                }
+                RelationReturnTarget::Browser => {
+                    self.detail_view = DetailView::Table;
+                    self.screen = Screen::Browser;
+                    self.relation_return_target = RelationReturnTarget::Detail;
+                    self.status = "Returned to table browser.".into();
+                }
+            }
             return Ok(false);
         }
 
@@ -1897,6 +1918,7 @@ impl App {
         self.detail_drill_actions = None;
         self.detail_drill_index = 0;
         self.detail_nav_stack.clear();
+        self.relation_return_target = RelationReturnTarget::Detail;
         self.relation_graph = None;
         self.erd_graph = None;
         self.graph_lane = GraphLane::Center;
@@ -1977,6 +1999,24 @@ impl App {
         self.load_table_detail(table, DetailView::Table).await
     }
 
+    async fn open_selected_table_erd(&mut self) -> Result<()> {
+        let table = self
+            .selected_table()
+            .ok_or_else(|| anyhow!("no table is selected"))?;
+        self.open_detail_context(
+            DetailNavStackEntry {
+                investigation: InvestigationState::for_table(table.clone()),
+                selected_row: 0,
+            },
+            DetailView::Erd,
+            true,
+        )
+        .await?;
+        self.relation_return_target = RelationReturnTarget::Browser;
+        self.status = format!("Opened {} in erd view.", table.display_name());
+        Ok(())
+    }
+
     async fn load_table_detail(&mut self, table: TableRef, detail_view: DetailView) -> Result<()> {
         self.open_detail_context(
             DetailNavStackEntry {
@@ -2013,6 +2053,7 @@ impl App {
         self.workspace_prompt = None;
         self.detail_drill_actions = None;
         self.detail_drill_index = 0;
+        self.relation_return_target = RelationReturnTarget::Detail;
         if clear_drill_stack {
             self.detail_nav_stack.clear();
         }
@@ -2123,6 +2164,7 @@ impl App {
     }
 
     async fn enter_relation_view(&mut self, detail_view: DetailView) -> Result<()> {
+        self.relation_return_target = RelationReturnTarget::Detail;
         self.detail_view = detail_view;
         match detail_view {
             DetailView::Graph => {
@@ -2349,7 +2391,7 @@ impl App {
                 "Up/Down move | Enter confirm | Esc cancel"
             }
             Screen::Browser => {
-                "Enter detail | / filter | b bookmarks | r reload | Esc back | q quit"
+                "Enter detail | d erd | / filter | b bookmarks | r reload | Esc back | q quit"
             }
             Screen::Detail
                 if matches!(
@@ -2374,7 +2416,14 @@ impl App {
                 "Left/Right lane | Up/Down move-or-scroll | Enter center neighbor | b workspace | g/Esc detail | r reload | q quit"
             }
             Screen::Detail if self.detail_view == DetailView::Erd => {
-                "Arrow keys focus | h/j/k/l pan | Tab cycle | Enter open table | c center | b workspace | d/Esc detail | r reload | q quit"
+                match self.relation_return_target {
+                    RelationReturnTarget::Detail => {
+                        "Arrow keys focus | h/j/k/l pan | Tab cycle | Enter open table | c center | b workspace | d/Esc detail | r reload | q quit"
+                    }
+                    RelationReturnTarget::Browser => {
+                        "Arrow keys focus | h/j/k/l pan | Tab cycle | Enter open table | c center | b workspace | d/Esc browser | r reload | q quit"
+                    }
+                }
             }
             Screen::Detail
                 if matches!(
@@ -4531,6 +4580,7 @@ mod tests {
             detail_drill_actions: None,
             detail_drill_index: 0,
             detail_nav_stack: Vec::new(),
+            relation_return_target: RelationReturnTarget::Detail,
             relation_graph: None,
             erd_graph: None,
             graph_lane: GraphLane::Center,
@@ -5890,6 +5940,75 @@ mod tests {
         assert!(!should_quit);
         assert_eq!(app.detail_view, DetailView::Graph);
         assert_eq!(app.graph_lane, GraphLane::Center);
+    }
+
+    #[tokio::test]
+    async fn d_opens_erd_from_browser_for_selected_table() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("sample")
+            .join("readgrid_demo.db");
+        let session = Session::connect(&ConnectionProfile {
+            name: "sample".into(),
+            kind: DatabaseKind::Sqlite,
+            url: None,
+            path: Some(path),
+        })
+        .await
+        .unwrap();
+
+        let mut app = test_app(Screen::Browser, false);
+        app.session = Some(session);
+        app.load_tables(None).await.unwrap();
+        app.table_index = 1;
+        let expected_table = app.selected_table().unwrap();
+
+        let should_quit = app
+            .handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(!should_quit);
+        assert_eq!(app.screen, Screen::Detail);
+        assert_eq!(app.detail_view, DetailView::Erd);
+        assert_eq!(app.detail.as_ref().unwrap().table, expected_table);
+        assert_eq!(app.relation_return_target, RelationReturnTarget::Browser);
+        assert_eq!(
+            app.status,
+            format!("Opened {} in erd view.", expected_table.display_name())
+        );
+    }
+
+    #[tokio::test]
+    async fn esc_returns_to_browser_from_browser_opened_erd() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("sample")
+            .join("readgrid_demo.db");
+        let session = Session::connect(&ConnectionProfile {
+            name: "sample".into(),
+            kind: DatabaseKind::Sqlite,
+            url: None,
+            path: Some(path),
+        })
+        .await
+        .unwrap();
+
+        let mut app = test_app(Screen::Browser, false);
+        app.session = Some(session);
+        app.load_tables(None).await.unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let should_quit = app
+            .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(!should_quit);
+        assert_eq!(app.screen, Screen::Browser);
+        assert_eq!(app.detail_view, DetailView::Table);
+        assert_eq!(app.relation_return_target, RelationReturnTarget::Detail);
+        assert_eq!(app.status, "Returned to table browser.");
     }
 
     #[tokio::test]
