@@ -3,14 +3,21 @@ use std::{env, fs, path::PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::{app::CliArgs, db::ConnectionProfile};
+use crate::{
+    app::{CliArgs, StartupView},
+    db::ConnectionProfile,
+};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct McpContext {
     #[serde(default)]
     pub profile: Option<ConnectionProfile>,
+    #[serde(default, alias = "preferred_schema")]
+    pub target_schema: Option<String>,
     #[serde(default)]
-    pub preferred_schema: Option<String>,
+    pub target_table: Option<String>,
+    #[serde(default)]
+    pub target_view: Option<StartupView>,
 }
 
 impl McpContext {
@@ -31,10 +38,6 @@ impl McpContext {
 
         Ok(None)
     }
-
-    pub fn into_profile(self) -> Option<ConnectionProfile> {
-        self.profile
-    }
 }
 
 fn read_context_file(path: &PathBuf) -> Result<Option<McpContext>> {
@@ -47,4 +50,19 @@ fn read_context_file(path: &PathBuf) -> Result<Option<McpContext>> {
     let context = serde_json::from_str::<McpContext>(&raw)
         .with_context(|| format!("failed to parse {}", path.display()))?;
     Ok(Some(context))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::McpContext;
+
+    #[test]
+    fn preferred_schema_alias_still_populates_target_schema() {
+        let context: McpContext =
+            serde_json::from_str(r#"{"preferred_schema":"public","target_table":"tasks"}"#)
+                .unwrap();
+
+        assert_eq!(context.target_schema.as_deref(), Some("public"));
+        assert_eq!(context.target_table.as_deref(), Some("tasks"));
+    }
 }
