@@ -93,7 +93,7 @@ sqlite3 sample/readgrid_demo.db < sample/readgrid_demo.sql
 ### 기본 키 조작
 
 - 연결 화면: `Enter` 연결, `Esc` 또는 `q` 종료
-- 테이블 브라우저: `/` 필터, `r` 새로고침, `Enter` 상세 보기
+- 테이블 브라우저: `/` 필터, `r` 새로고침, `Enter` 상세 보기, `d` 전체 ERD
 - 상세 화면: `b` 작업공간 메뉴, `e` CSV 내보내기, `f` 필터 추가, `[` `]` 정렬 컬럼 이동, `s` 정렬 방향 전환, `n` `p` 페이지 이동, `Enter` 관계 이동, `g` 관계 그래프, `d` 전체 ERD, `Esc` 뒤로
 - 관계 그래프: `g` 또는 `Esc`로 상세 화면 복귀
 - ERD: 방향키 포커스 이동, `h` `j` `k` `l` 패닝, `Tab`/`Shift-Tab` 포커스 순환, `Enter` 테이블 상세 열기, `c` 현재 포커스 중심 이동, `d` 또는 `Esc`로 상세 화면 복귀
@@ -199,7 +199,7 @@ sqlite3 sample/readgrid_demo.db < sample/readgrid_demo.sql
 ### Key Controls
 
 - Connections: `Enter` connect, `Esc` or `q` quit
-- Table browser: `/` filter, `r` reload, `Enter` open detail
+- Table browser: `/` filter, `r` reload, `Enter` open detail, `d` full ERD
 - Detail view: `b` workspace menu, `e` export, `f` add filter, `[` `]` move sort column, `s` toggle sort order, `n` `p` change page, `Enter` open relations, `g` relationship graph, `d` full ERD, `Esc` back
 - Relationship graph: `g` or `Esc` returns to table detail
 - ERD: arrow keys move focus, `h` `j` `k` `l` pan, `Tab`/`Shift-Tab` cycle focus, `Enter` opens table detail, `c` recenters on the focused table, `d` or `Esc` returns to table detail
