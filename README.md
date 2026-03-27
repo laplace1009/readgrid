@@ -196,9 +196,9 @@ sqlite3 sample/readgrid_demo.db < sample/readgrid_demo.sql
 
 - Connections: `Enter` connect, `Esc` or `q` quit
 - Table browser: `/` filter, `r` reload, `Enter` open detail
-- Detail view: `b` workspace menu, `e` export CSV, `f` add filter, `[` `]` move sort column, `s` toggle sort order, `n` `p` change page, `Enter` open relations, `g` relationship graph, `Esc` back
+- Detail view: `b` workspace menu, `e` export, `f` add filter, `[` `]` move sort column, `s` toggle sort order, `n` `p` change page, `Enter` open relations, `g` relationship graph, `Esc` back
 - Workspace menu: save/open bookmarks and save/apply table-scoped filter presets
-- CSV export saves only the currently visible preview page in v1, and the default path is suggested under `db_csv/`.
+- Export prompt: `Tab` switches between the visible page and all matching rows, `f` switches between CSV and JSON, and the default path is suggested under `db_csv/`.
 
 ### Development
 
