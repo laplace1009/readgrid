@@ -10,8 +10,8 @@ use sqlx::{Executor, SqlitePool, sqlite::SqliteConnectOptions};
 use super::{
     ColumnMeta, ConnectionProfile, DataPreview, DatabaseKind, ExportFormat, ExportRequest,
     ExportScope, FilterOperator, ForeignKeyMeta, InvestigationSource, InvestigationState,
-    PAGE_SIZE, PreviewCell, PreviewFilter, PreviewRow, RelationNodeRole,
-    RelationshipDirection, Session, SortState, TableDetail, TableRef, build_drill_through_actions,
+    PAGE_SIZE, PreviewCell, PreviewFilter, PreviewRow, RelationNodeRole, RelationshipDirection,
+    Session, SortState, TableDetail, TableRef, build_drill_through_actions,
     query::{PreviewDialect, build_filter_clause},
     relations::{collect_key_columns, relation_node_specs},
     write_preview_csv, write_preview_json,
