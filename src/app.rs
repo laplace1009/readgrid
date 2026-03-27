@@ -4094,6 +4094,19 @@ mod tests {
         ))
     }
 
+    fn temp_export_path(name: &str, extension: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "readgrid_app_{name}_{}_{}.{}",
+            std::process::id(),
+            unique,
+            extension
+        ))
+    }
+
     fn temp_state_path(name: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
