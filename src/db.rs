@@ -1,11 +1,12 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, anyhow};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, ser::SerializeMap};
 use sqlx::{PgPool, Row, SqlitePool, postgres::PgRow, sqlite::SqliteRow};
 
 pub const PAGE_SIZE: usize = 50;
@@ -255,11 +256,35 @@ impl ExportScope {
             Self::AllMatchingRows => "all matching rows",
         }
     }
+
+    pub fn file_suffix(&self) -> &'static str {
+        match self {
+            Self::VisiblePage => "",
+            Self::AllMatchingRows => "_all",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportFormat {
     Csv,
+    Json,
+}
+
+impl ExportFormat {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Csv => "CSV",
+            Self::Json => "JSON",
+        }
+    }
+
+    pub fn extension(&self) -> &'static str {
+        match self {
+            Self::Csv => "csv",
+            Self::Json => "json",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,6 +297,7 @@ pub struct ExportRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportSummary {
     pub rows_written: usize,
+    pub format: ExportFormat,
     pub scope: ExportScope,
     pub path: PathBuf,
 }
@@ -341,6 +367,29 @@ pub fn write_preview_csv(preview: &DataPreview, path: &Path) -> Result<usize> {
     Ok(rows_written)
 }
 
+pub fn write_preview_json(preview: &DataPreview, path: &Path) -> Result<usize> {
+    let mut writer = create_json_writer(path)?;
+
+    for row in &preview.rows {
+        writer.write_row(
+            &preview.columns,
+            &row.cells
+                .iter()
+                .map(|cell| cell.raw_value.clone())
+                .collect::<Vec<_>>(),
+        )?;
+    }
+
+    writer.finish()
+}
+
+pub fn write_preview_export(preview: &DataPreview, request: &ExportRequest) -> Result<usize> {
+    match request.format {
+        ExportFormat::Csv => write_preview_csv(preview, &request.path),
+        ExportFormat::Json => write_preview_json(preview, &request.path),
+    }
+}
+
 fn create_csv_writer(path: &Path) -> Result<csv::Writer<std::fs::File>> {
     if let Some(parent) = path
         .parent()
@@ -353,6 +402,23 @@ fn create_csv_writer(path: &Path) -> Result<csv::Writer<std::fs::File>> {
     let file = std::fs::File::create(path)
         .with_context(|| format!("failed to create {}", path.display()))?;
     Ok(csv::Writer::from_writer(file))
+}
+
+fn create_json_writer(path: &Path) -> Result<JsonArrayWriter<BufWriter<std::fs::File>>> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    }
+
+    let file = std::fs::File::create(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    Ok(JsonArrayWriter::new(
+        BufWriter::new(file),
+        path.to_path_buf(),
+    ))
 }
 
 fn write_csv_header(
@@ -382,6 +448,77 @@ fn flush_csv_writer(writer: &mut csv::Writer<std::fs::File>, path: &Path) -> Res
         .flush()
         .with_context(|| format!("failed to flush CSV writer for {}", path.display()))?;
     Ok(())
+}
+
+struct JsonArrayWriter<W: Write> {
+    writer: W,
+    path: PathBuf,
+    rows_written: usize,
+}
+
+impl<W: Write> JsonArrayWriter<W> {
+    fn new(writer: W, path: PathBuf) -> Self {
+        Self {
+            writer,
+            path,
+            rows_written: 0,
+        }
+    }
+
+    fn write_row(&mut self, columns: &[String], values: &[Option<String>]) -> Result<()> {
+        if self.rows_written == 0 {
+            self.writer.write_all(b"[").with_context(|| {
+                format!("failed to write JSON header to {}", self.path.display())
+            })?;
+        } else {
+            self.writer.write_all(b",").with_context(|| {
+                format!("failed to write JSON separator to {}", self.path.display())
+            })?;
+        }
+
+        serde_json::to_writer(&mut self.writer, &JsonExportRow { columns, values })
+            .with_context(|| format!("failed to write JSON row to {}", self.path.display()))?;
+        self.rows_written += 1;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<usize> {
+        if self.rows_written == 0 {
+            self.writer.write_all(b"[]").with_context(|| {
+                format!(
+                    "failed to write empty JSON array to {}",
+                    self.path.display()
+                )
+            })?;
+        } else {
+            self.writer.write_all(b"]").with_context(|| {
+                format!("failed to finalize JSON output for {}", self.path.display())
+            })?;
+        }
+
+        self.writer
+            .flush()
+            .with_context(|| format!("failed to flush JSON writer for {}", self.path.display()))?;
+        Ok(self.rows_written)
+    }
+}
+
+struct JsonExportRow<'a> {
+    columns: &'a [String],
+    values: &'a [Option<String>],
+}
+
+impl Serialize for JsonExportRow<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.columns.len()))?;
+        for (column, value) in self.columns.iter().zip(self.values.iter()) {
+            map.serialize_entry(column, value)?;
+        }
+        map.end()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -572,18 +709,14 @@ impl Session {
         }
     }
 
-    pub async fn export_csv(
+    pub async fn export(
         &self,
         state: &InvestigationState,
         request: &ExportRequest,
     ) -> Result<ExportSummary> {
-        if request.format != ExportFormat::Csv {
-            return Err(anyhow!("unsupported export format"));
-        }
-
         match self {
-            Self::Postgres(pool) => export_postgres_csv(pool, state, request).await,
-            Self::Sqlite(pool) => export_sqlite_csv(pool, state, request).await,
+            Self::Postgres(pool) => export_postgres_data(pool, state, request).await,
+            Self::Sqlite(pool) => export_sqlite_data(pool, state, request).await,
         }
     }
 
@@ -1130,8 +1263,7 @@ async fn export_postgres_page(
     plan: &QueryPlan,
     page: usize,
     page_size: usize,
-    writer: &mut csv::Writer<std::fs::File>,
-    path: &Path,
+    writer: &mut impl ExportRowWriter,
 ) -> Result<usize> {
     let query = plan.paged_sql(page_size, page * page_size);
     let mut query = sqlx::query(&query);
@@ -1142,7 +1274,7 @@ async fn export_postgres_page(
     let rows = query.fetch_all(pool).await?;
     let mut rows_written = 0;
     for row in rows {
-        rows_written += write_pg_row(writer, &row, plan.columns.len(), path)?;
+        rows_written += write_pg_row(writer, &row, &plan.columns)?;
     }
 
     Ok(rows_written)
@@ -1151,15 +1283,13 @@ async fn export_postgres_page(
 async fn export_postgres_all_rows(
     pool: &PgPool,
     plan: &QueryPlan,
-    writer: &mut csv::Writer<std::fs::File>,
-    path: &Path,
+    writer: &mut impl ExportRowWriter,
 ) -> Result<usize> {
     let mut page = 0;
     let mut rows_written = 0;
 
     loop {
-        let written =
-            export_postgres_page(pool, plan, page, EXPORT_BATCH_SIZE, writer, path).await?;
+        let written = export_postgres_page(pool, plan, page, EXPORT_BATCH_SIZE, writer).await?;
         rows_written += written;
         if written < EXPORT_BATCH_SIZE {
             break;
@@ -1175,8 +1305,7 @@ async fn export_sqlite_page(
     plan: &QueryPlan,
     page: usize,
     page_size: usize,
-    writer: &mut csv::Writer<std::fs::File>,
-    path: &Path,
+    writer: &mut impl ExportRowWriter,
 ) -> Result<usize> {
     let query = plan.paged_sql(page_size, page * page_size);
     let mut query = sqlx::query(&query);
@@ -1187,7 +1316,7 @@ async fn export_sqlite_page(
     let rows = query.fetch_all(pool).await?;
     let mut rows_written = 0;
     for row in rows {
-        rows_written += write_sqlite_row(writer, &row, plan.columns.len(), path)?;
+        rows_written += write_sqlite_row(writer, &row, &plan.columns)?;
     }
 
     Ok(rows_written)
@@ -1196,14 +1325,13 @@ async fn export_sqlite_page(
 async fn export_sqlite_all_rows(
     pool: &SqlitePool,
     plan: &QueryPlan,
-    writer: &mut csv::Writer<std::fs::File>,
-    path: &Path,
+    writer: &mut impl ExportRowWriter,
 ) -> Result<usize> {
     let mut page = 0;
     let mut rows_written = 0;
 
     loop {
-        let written = export_sqlite_page(pool, plan, page, EXPORT_BATCH_SIZE, writer, path).await?;
+        let written = export_sqlite_page(pool, plan, page, EXPORT_BATCH_SIZE, writer).await?;
         rows_written += written;
         if written < EXPORT_BATCH_SIZE {
             break;
@@ -1214,113 +1342,167 @@ async fn export_sqlite_all_rows(
     Ok(rows_written)
 }
 
+trait ExportRowWriter {
+    fn write_row(&mut self, columns: &[String], values: &[Option<String>]) -> Result<()>;
+    fn finish(self) -> Result<usize>
+    where
+        Self: Sized;
+}
+
+struct CsvExportWriter {
+    writer: csv::Writer<std::fs::File>,
+    path: PathBuf,
+    rows_written: usize,
+}
+
+impl CsvExportWriter {
+    fn new(path: &Path, columns: &[String]) -> Result<Self> {
+        let mut writer = create_csv_writer(path)?;
+        write_csv_header(&mut writer, columns, path)?;
+        Ok(Self {
+            writer,
+            path: path.to_path_buf(),
+            rows_written: 0,
+        })
+    }
+}
+
+impl ExportRowWriter for CsvExportWriter {
+    fn write_row(&mut self, _columns: &[String], values: &[Option<String>]) -> Result<()> {
+        let rendered = values
+            .iter()
+            .map(|value| value.as_deref().unwrap_or("NULL"))
+            .collect::<Vec<_>>();
+        write_csv_record(&mut self.writer, rendered, &self.path)?;
+        self.rows_written += 1;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<usize> {
+        flush_csv_writer(&mut self.writer, &self.path)?;
+        Ok(self.rows_written)
+    }
+}
+
+impl<W: Write> ExportRowWriter for JsonArrayWriter<W> {
+    fn write_row(&mut self, columns: &[String], values: &[Option<String>]) -> Result<()> {
+        JsonArrayWriter::write_row(self, columns, values)
+    }
+
+    fn finish(self) -> Result<usize> {
+        JsonArrayWriter::finish(self)
+    }
+}
+
 fn write_pg_row(
-    writer: &mut csv::Writer<std::fs::File>,
+    writer: &mut impl ExportRowWriter,
     row: &PgRow,
-    column_count: usize,
-    path: &Path,
+    columns: &[String],
 ) -> Result<usize> {
-    let rendered = render_pg_row(row, column_count);
-    write_csv_record(writer, rendered.iter().map(String::as_str), path)?;
+    let raw_values = raw_pg_row(row, columns.len());
+    writer.write_row(columns, &raw_values)?;
     Ok(1)
 }
 
 fn write_sqlite_row(
-    writer: &mut csv::Writer<std::fs::File>,
+    writer: &mut impl ExportRowWriter,
     row: &SqliteRow,
-    column_count: usize,
-    path: &Path,
+    columns: &[String],
 ) -> Result<usize> {
-    let rendered = render_sqlite_row(row, column_count);
-    write_csv_record(writer, rendered.iter().map(String::as_str), path)?;
+    let raw_values = raw_sqlite_row(row, columns.len());
+    writer.write_row(columns, &raw_values)?;
     Ok(1)
 }
 
-fn render_pg_row(row: &PgRow, column_count: usize) -> Vec<String> {
+fn raw_pg_row(row: &PgRow, column_count: usize) -> Vec<Option<String>> {
     (0..column_count)
-        .map(|index| {
-            row.try_get::<Option<String>, _>(index)
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| "NULL".into())
-        })
+        .map(|index| row.try_get::<Option<String>, _>(index).ok().flatten())
         .collect()
 }
 
-fn render_sqlite_row(row: &SqliteRow, column_count: usize) -> Vec<String> {
+fn raw_sqlite_row(row: &SqliteRow, column_count: usize) -> Vec<Option<String>> {
     (0..column_count)
-        .map(|index| {
-            row.try_get::<Option<String>, _>(index)
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| "NULL".into())
-        })
+        .map(|index| row.try_get::<Option<String>, _>(index).ok().flatten())
         .collect()
 }
 
-async fn export_postgres_csv(
+async fn export_postgres_data(
     pool: &PgPool,
     state: &InvestigationState,
     request: &ExportRequest,
 ) -> Result<ExportSummary> {
     let plan = build_postgres_query_plan(pool, state).await?;
-    let mut writer = create_csv_writer(&request.path)?;
-    write_csv_header(&mut writer, &plan.columns, &request.path)?;
-
-    let rows_written = match request.scope {
-        ExportScope::VisiblePage => {
-            export_postgres_page(
-                pool,
-                &plan,
-                state.page,
-                PAGE_SIZE,
-                &mut writer,
-                &request.path,
-            )
-            .await?
+    let rows_written = match request.format {
+        ExportFormat::Csv => {
+            let mut writer = CsvExportWriter::new(&request.path, &plan.columns)?;
+            match request.scope {
+                ExportScope::VisiblePage => {
+                    export_postgres_page(pool, &plan, state.page, PAGE_SIZE, &mut writer).await?;
+                }
+                ExportScope::AllMatchingRows => {
+                    export_postgres_all_rows(pool, &plan, &mut writer).await?;
+                }
+            }
+            writer.finish()?
         }
-        ExportScope::AllMatchingRows => {
-            export_postgres_all_rows(pool, &plan, &mut writer, &request.path).await?
+        ExportFormat::Json => {
+            let mut writer = create_json_writer(&request.path)?;
+            match request.scope {
+                ExportScope::VisiblePage => {
+                    export_postgres_page(pool, &plan, state.page, PAGE_SIZE, &mut writer).await?;
+                }
+                ExportScope::AllMatchingRows => {
+                    export_postgres_all_rows(pool, &plan, &mut writer).await?;
+                }
+            }
+            writer.finish()?
         }
     };
 
-    flush_csv_writer(&mut writer, &request.path)?;
     Ok(ExportSummary {
         rows_written,
+        format: request.format,
         scope: request.scope,
         path: request.path.clone(),
     })
 }
 
-async fn export_sqlite_csv(
+async fn export_sqlite_data(
     pool: &SqlitePool,
     state: &InvestigationState,
     request: &ExportRequest,
 ) -> Result<ExportSummary> {
     let plan = build_sqlite_query_plan(pool, state).await?;
-    let mut writer = create_csv_writer(&request.path)?;
-    write_csv_header(&mut writer, &plan.columns, &request.path)?;
-
-    let rows_written = match request.scope {
-        ExportScope::VisiblePage => {
-            export_sqlite_page(
-                pool,
-                &plan,
-                state.page,
-                PAGE_SIZE,
-                &mut writer,
-                &request.path,
-            )
-            .await?
+    let rows_written = match request.format {
+        ExportFormat::Csv => {
+            let mut writer = CsvExportWriter::new(&request.path, &plan.columns)?;
+            match request.scope {
+                ExportScope::VisiblePage => {
+                    export_sqlite_page(pool, &plan, state.page, PAGE_SIZE, &mut writer).await?;
+                }
+                ExportScope::AllMatchingRows => {
+                    export_sqlite_all_rows(pool, &plan, &mut writer).await?;
+                }
+            }
+            writer.finish()?
         }
-        ExportScope::AllMatchingRows => {
-            export_sqlite_all_rows(pool, &plan, &mut writer, &request.path).await?
+        ExportFormat::Json => {
+            let mut writer = create_json_writer(&request.path)?;
+            match request.scope {
+                ExportScope::VisiblePage => {
+                    export_sqlite_page(pool, &plan, state.page, PAGE_SIZE, &mut writer).await?;
+                }
+                ExportScope::AllMatchingRows => {
+                    export_sqlite_all_rows(pool, &plan, &mut writer).await?;
+                }
+            }
+            writer.finish()?
         }
     };
 
-    flush_csv_writer(&mut writer, &request.path)?;
     Ok(ExportSummary {
         rows_written,
+        format: request.format,
         scope: request.scope,
         path: request.path.clone(),
     })
@@ -1552,6 +1734,19 @@ mod tests {
             "readgrid_{name}_{}_{}.csv",
             std::process::id(),
             unique
+        ))
+    }
+
+    fn temp_export_path(name: &str, extension: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "readgrid_{name}_{}_{}.{}",
+            std::process::id(),
+            unique,
+            extension
         ))
     }
 
@@ -1896,6 +2091,44 @@ mod tests {
     }
 
     #[test]
+    fn write_preview_json_preserves_column_order_and_nulls() {
+        let path = temp_export_path("preview_json", "json");
+        let preview = sample_csv_preview(vec![vec![Some("1"), Some("alpha"), None]]);
+
+        write_preview_json(&preview, &path).unwrap();
+
+        let raw = fs::read_to_string(&path).unwrap();
+        let rows = serde_json::from_str::<Vec<serde_json::Value>>(&raw).unwrap();
+        fs::remove_file(&path).ok();
+
+        assert!(raw.contains(r#"[{"id":"1","title":"alpha","notes":null}]"#));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], serde_json::Value::String("1".into()));
+        assert_eq!(rows[0]["notes"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn csv_and_json_exports_handle_nulls_differently() {
+        let csv_path = temp_csv_path("null_compare");
+        let json_path = temp_export_path("null_compare", "json");
+        let preview = sample_csv_preview(vec![vec![Some("1"), Some("alpha"), None]]);
+
+        write_preview_csv(&preview, &csv_path).unwrap();
+        write_preview_json(&preview, &json_path).unwrap();
+
+        let csv_raw = fs::read_to_string(&csv_path).unwrap();
+        let json_rows = serde_json::from_str::<Vec<serde_json::Value>>(
+            &fs::read_to_string(&json_path).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(&csv_path).ok();
+        fs::remove_file(&json_path).ok();
+
+        assert!(csv_raw.contains("NULL"));
+        assert_eq!(json_rows[0]["notes"], serde_json::Value::Null);
+    }
+
+    #[test]
     fn drill_through_actions_cover_outgoing_incoming_and_null_values() {
         let detail = TableDetail {
             table: sample_table("tasks"),
@@ -2072,7 +2305,7 @@ mod tests {
         );
 
         let summary = session
-            .export_csv(
+            .export(
                 &state,
                 &ExportRequest {
                     format: ExportFormat::Csv,
@@ -2092,6 +2325,7 @@ mod tests {
         fs::remove_file(&export_path).ok();
         fs::remove_file(&db_path).ok();
 
+        assert_eq!(summary.format, ExportFormat::Csv);
         assert_eq!(summary.scope, ExportScope::AllMatchingRows);
         assert_eq!(summary.rows_written, 45);
         assert_eq!(
@@ -2102,6 +2336,68 @@ mod tests {
         assert_eq!(rows.first().unwrap()[0], "1");
         assert_eq!(rows.last().unwrap()[0], "67");
         assert!(rows.iter().all(|row| row[2] == "todo"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_full_json_export_writes_all_matching_rows_across_pages() {
+        let (session, db_path) = large_sqlite_session(PAGE_SIZE + 17).await;
+        let export_path = temp_export_path("all_matching_rows", "json");
+        let state = sample_investigation(
+            "tasks",
+            Some(SortState {
+                column_name: "title".into(),
+                descending: false,
+            }),
+            vec![PreviewFilter {
+                column_name: "status".into(),
+                operator: FilterOperator::Equals,
+                value: Some("todo".into()),
+            }],
+            1,
+        );
+
+        let summary = session
+            .export(
+                &state,
+                &ExportRequest {
+                    format: ExportFormat::Json,
+                    scope: ExportScope::AllMatchingRows,
+                    path: export_path.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let raw = fs::read_to_string(&export_path).unwrap();
+        let rows = serde_json::from_str::<Vec<serde_json::Value>>(&raw).unwrap();
+        fs::remove_file(&export_path).ok();
+        fs::remove_file(&db_path).ok();
+
+        assert_eq!(summary.format, ExportFormat::Json);
+        assert_eq!(summary.scope, ExportScope::AllMatchingRows);
+        assert_eq!(summary.rows_written, 45);
+        assert_eq!(rows.len(), 45);
+        let first_object = raw
+            .strip_prefix('[')
+            .and_then(|text| text.split("},{").next())
+            .unwrap();
+        let id_pos = first_object.find(r#""id":"#).unwrap();
+        let title_pos = first_object.find(r#""title":"#).unwrap();
+        let status_pos = first_object.find(r#""status":"#).unwrap();
+        assert!(id_pos < title_pos);
+        assert!(title_pos < status_pos);
+        assert_eq!(
+            rows.first().unwrap()["id"],
+            serde_json::Value::String("1".into())
+        );
+        assert_eq!(
+            rows.last().unwrap()["id"],
+            serde_json::Value::String("67".into())
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row["status"] == serde_json::Value::String("todo".into()))
+        );
     }
 
     #[tokio::test]
