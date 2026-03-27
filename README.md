@@ -89,8 +89,10 @@ sqlite3 sample/readgrid_demo.db < sample/readgrid_demo.sql
 
 - 연결 화면: `Enter` 연결, `Esc` 또는 `q` 종료
 - 테이블 브라우저: `/` 필터, `r` 새로고침, `Enter` 상세 보기
-- 상세 화면: `e` CSV 내보내기, `f` 필터 추가, `[` `]` 정렬 컬럼 이동, `s` 정렬 방향 전환, `n` `p` 페이지 이동, `Enter` 관계 이동, `g` 관계 그래프, `Esc` 뒤로
-- CSV 내보내기는 현재 화면에 보이는 미리보기 페이지 한 장만 저장하며, 기본 경로는 `db_csv/` 아래에 제안됩니다.
+- 상세 화면: `e` 내보내기, `f` 필터 추가, `[` `]` 정렬 컬럼 이동, `s` 정렬 방향 전환, `n` `p` 페이지 이동, `Enter` 관계 이동, `g` 관계 그래프, `Esc` 뒤로
+- 내보내기 팝업에서는 `Tab`으로 범위(`visible page`/`all matching rows`)를 바꾸고, 제안 경로를 아직 수정하지 않았다면 `f`로 형식(`CSV`/`JSON`)을 바꿉니다.
+- JSON 내보내기는 컬럼 이름을 키로 쓰는 객체 배열을 기록하며, DB `NULL` 값은 문자열 `"NULL"`이 아니라 JSON `null`로 저장됩니다.
+- 기본 제안 경로는 계속 `db_csv/` 아래를 사용하며, 형식과 범위에 따라 `tasks.csv`, `tasks_all.csv`, `tasks.json`, `tasks_all.json`처럼 파일명이 달라집니다.
 
 ### 개발
 
@@ -187,8 +189,10 @@ sqlite3 sample/readgrid_demo.db < sample/readgrid_demo.sql
 
 - Connections: `Enter` connect, `Esc` or `q` quit
 - Table browser: `/` filter, `r` reload, `Enter` open detail
-- Detail view: `e` export CSV, `f` add filter, `[` `]` move sort column, `s` toggle sort order, `n` `p` change page, `Enter` open relations, `g` relationship graph, `Esc` back
-- CSV export saves only the currently visible preview page in v1, and the default path is suggested under `db_csv/`.
+- Detail view: `e` export, `f` add filter, `[` `]` move sort column, `s` toggle sort order, `n` `p` change page, `Enter` open relations, `g` relationship graph, `Esc` back
+- In the export popup, `Tab` switches scope (`visible page` or `all matching rows`), and `f` switches format (`CSV` or `JSON`) before you start editing the suggested path.
+- JSON export writes an array of objects keyed by column name, and database `NULL` values are emitted as JSON `null`, not the rendered `"NULL"` string.
+- The suggested path still defaults under `db_csv/`, with filenames varying by scope and format: `tasks.csv`, `tasks_all.csv`, `tasks.json`, and `tasks_all.json`.
 
 ### Development
 
