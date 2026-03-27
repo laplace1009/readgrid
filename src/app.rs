@@ -17,10 +17,10 @@ use ratatui::{
         Wrap,
     },
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::ConfigStore,
+    config::{BookmarkConnectionTarget, ConfigStore, FilterPreset, SavedBookmark},
     db::{
         ConnectionProfile, DataPreview, DatabaseKind, DrillThroughAction, ExportFormat,
         ExportRequest, ExportScope, ExportSummary, FilterOperator, ForeignKeyMeta,
@@ -47,10 +47,12 @@ pub struct CliArgs {
     #[arg(long, value_enum)]
     pub view: Option<StartupView>,
     #[arg(long)]
+    pub bookmark: Option<String>,
+    #[arg(long)]
     pub mcp_context_file: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StartupView {
     Detail,
@@ -111,6 +113,64 @@ enum DetailExportPrompt {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceAction {
+    SaveBookmark,
+    OpenBookmark,
+    SavePreset,
+    ApplyPreset,
+}
+
+impl WorkspaceAction {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::SaveBookmark => "Save bookmark",
+            Self::OpenBookmark => "Open bookmark",
+            Self::SavePreset => "Save preset",
+            Self::ApplyPreset => "Apply preset",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceEntryKind {
+    Bookmark,
+    Preset,
+}
+
+impl WorkspaceEntryKind {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Bookmark => "bookmark",
+            Self::Preset => "preset",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum WorkspacePrompt {
+    ChooseAction {
+        actions: Vec<WorkspaceAction>,
+        index: usize,
+    },
+    EnterName {
+        kind: WorkspaceEntryKind,
+        value: String,
+    },
+    ConfirmOverwrite {
+        kind: WorkspaceEntryKind,
+        value: String,
+    },
+    OpenBookmark {
+        bookmarks: Vec<SavedBookmark>,
+        index: usize,
+    },
+    ApplyPreset {
+        presets: Vec<FilterPreset>,
+        index: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DetailFilterOutcome {
     None,
     ReloadPreview,
@@ -119,6 +179,7 @@ enum DetailFilterOutcome {
 #[derive(Debug, Clone)]
 struct ConnectionCandidate {
     profile: ConnectionProfile,
+    bookmark_target: BookmarkConnectionTarget,
     source: &'static str,
 }
 
@@ -127,11 +188,57 @@ struct StartupTarget {
     schema: Option<String>,
     table: Option<String>,
     view: Option<StartupView>,
+    filters: Vec<PreviewFilter>,
+    sort: Option<SortState>,
 }
 
 impl StartupTarget {
     fn is_empty(&self) -> bool {
-        self.schema.is_none() && self.table.is_none() && self.view.is_none()
+        self.schema.is_none()
+            && self.table.is_none()
+            && self.view.is_none()
+            && self.filters.is_empty()
+            && self.sort.is_none()
+    }
+
+    fn investigation_for_table(&self, table: TableRef) -> InvestigationState {
+        InvestigationState {
+            source: InvestigationSource::Table(table),
+            sort: self.sort.clone(),
+            filters: self.filters.clone(),
+            page: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BookmarkStartupContext {
+    bookmark: SavedBookmark,
+    profile: ConnectionProfile,
+}
+
+#[derive(Debug, Clone, Default)]
+struct BookmarkDefaults {
+    cli: Option<BookmarkStartupContext>,
+    mcp: Option<BookmarkStartupContext>,
+    warning: Option<String>,
+}
+
+impl BookmarkDefaults {
+    fn cli_bookmark(&self) -> Option<&SavedBookmark> {
+        self.cli.as_ref().map(|context| &context.bookmark)
+    }
+
+    fn mcp_bookmark(&self) -> Option<&SavedBookmark> {
+        self.mcp.as_ref().map(|context| &context.bookmark)
+    }
+
+    fn cli_profile(&self) -> Option<&ConnectionProfile> {
+        self.cli.as_ref().map(|context| &context.profile)
+    }
+
+    fn mcp_profile(&self) -> Option<&ConnectionProfile> {
+        self.mcp.as_ref().map(|context| &context.profile)
     }
 }
 
@@ -154,6 +261,7 @@ pub struct App {
     table_search_mode: bool,
     session: Option<Session>,
     active_profile: Option<ConnectionProfile>,
+    active_connection_target: Option<BookmarkConnectionTarget>,
     active_schema: Option<String>,
     detail: Option<TableDetail>,
     active_investigation: Option<InvestigationState>,
@@ -161,6 +269,7 @@ pub struct App {
     detail_filter_index: usize,
     detail_filter_prompt: Option<DetailFilterPrompt>,
     detail_export_prompt: Option<DetailExportPrompt>,
+    workspace_prompt: Option<WorkspacePrompt>,
     detail_drill_actions: Option<Vec<DrillThroughAction>>,
     detail_drill_index: usize,
     detail_nav_stack: Vec<DetailNavStackEntry>,
@@ -193,11 +302,20 @@ impl App {
         }
 
         let example_config = ConfigStore::example_profiles();
-        let startup_target = build_startup_target(&args, mcp_context.as_ref());
+        let bookmark_defaults = resolve_bookmark_defaults(&args, &config, mcp_context.as_ref());
+        let startup_target = build_startup_target(&args, mcp_context.as_ref(), &bookmark_defaults);
         let (candidates, selected_index, pending_auto_connect) =
-            build_candidates(&args, &config, mcp_context.as_ref());
+            build_candidates(&args, &config, mcp_context.as_ref(), &bookmark_defaults);
 
-        let status = if candidates.is_empty() {
+        let status = if let Some(warning) = bookmark_defaults.warning {
+            if candidates.is_empty() {
+                format!(
+                    "{warning} No connection sources found. Use --pg-url/--sqlite-path or add profiles.toml."
+                )
+            } else {
+                format!("{warning} Choose a connection profile and press Enter.")
+            }
+        } else if candidates.is_empty() {
             "No connection sources found. Use --pg-url/--sqlite-path or add profiles.toml.".into()
         } else {
             "Choose a connection profile and press Enter.".into()
@@ -216,6 +334,7 @@ impl App {
             table_search_mode: false,
             session: None,
             active_profile: None,
+            active_connection_target: None,
             active_schema: None,
             detail: None,
             active_investigation: None,
@@ -223,6 +342,7 @@ impl App {
             detail_filter_index: 0,
             detail_filter_prompt: None,
             detail_export_prompt: None,
+            workspace_prompt: None,
             detail_drill_actions: None,
             detail_drill_index: 0,
             detail_nav_stack: Vec::new(),
@@ -317,6 +437,11 @@ impl App {
             return Ok(false);
         }
 
+        if self.workspace_prompt.is_some() {
+            self.handle_workspace_prompt_key(key).await?;
+            return Ok(false);
+        }
+
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.move_table(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_table(1),
@@ -330,6 +455,7 @@ impl App {
             KeyCode::Enter => {
                 self.load_selected_table_detail().await?;
             }
+            KeyCode::Char('b') => self.start_workspace_prompt(),
             KeyCode::Esc => {
                 if self.session_kind() == Some(DatabaseKind::Postgres) {
                     self.screen = Screen::Schemas;
@@ -345,6 +471,11 @@ impl App {
     }
 
     async fn handle_detail_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.workspace_prompt.is_some() {
+            self.handle_workspace_prompt_key(key).await?;
+            return Ok(false);
+        }
+
         if self.detail_view == DetailView::Graph {
             return self.handle_graph_key(key).await;
         }
@@ -379,6 +510,7 @@ impl App {
             KeyCode::Char('g') => {
                 self.enter_graph_view().await?;
             }
+            KeyCode::Char('b') => self.start_workspace_prompt(),
             KeyCode::Char('e') => self.start_detail_export_prompt(),
             KeyCode::Char('f') => self.start_detail_filter_prompt(),
             KeyCode::Char('h') | KeyCode::Left => self.move_detail_filter_selection(-1),
@@ -459,6 +591,7 @@ impl App {
                 self.reload_relation_graph().await?;
                 self.status = "Reloaded relationship graph.".into();
             }
+            KeyCode::Char('b') => self.start_workspace_prompt(),
             KeyCode::Enter => {
                 if self.graph_lane == GraphLane::Center {
                     self.status = "Already centered on the current table.".into();
@@ -494,6 +627,389 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn start_workspace_prompt(&mut self) {
+        let actions = self.available_workspace_actions();
+        if actions.is_empty() {
+            self.status = "No workspace actions are available here.".into();
+            return;
+        }
+
+        if actions.len() == 1 {
+            self.start_workspace_action(actions[0]);
+            return;
+        }
+
+        self.workspace_prompt = Some(WorkspacePrompt::ChooseAction { actions, index: 0 });
+        self.status = "Choose a workspace action.".into();
+    }
+
+    fn available_workspace_actions(&self) -> Vec<WorkspaceAction> {
+        match self.screen {
+            Screen::Browser => vec![WorkspaceAction::OpenBookmark],
+            Screen::Detail if self.detail_view == DetailView::Graph => {
+                vec![WorkspaceAction::SaveBookmark, WorkspaceAction::OpenBookmark]
+            }
+            Screen::Detail => vec![
+                WorkspaceAction::SaveBookmark,
+                WorkspaceAction::OpenBookmark,
+                WorkspaceAction::SavePreset,
+                WorkspaceAction::ApplyPreset,
+            ],
+            _ => Vec::new(),
+        }
+    }
+
+    fn start_workspace_action(&mut self, action: WorkspaceAction) {
+        match action {
+            WorkspaceAction::SaveBookmark => self.start_save_bookmark_prompt(),
+            WorkspaceAction::OpenBookmark => self.start_open_bookmark_prompt(),
+            WorkspaceAction::SavePreset => self.start_save_preset_prompt(),
+            WorkspaceAction::ApplyPreset => self.start_apply_preset_prompt(),
+        }
+    }
+
+    fn start_save_bookmark_prompt(&mut self) {
+        let Some(detail) = self.detail.as_ref() else {
+            self.status = "Open a table detail first to save a bookmark.".into();
+            return;
+        };
+        if self.active_connection_target.is_none() {
+            self.status = "No active connection target is available for bookmark saving.".into();
+            return;
+        }
+
+        self.workspace_prompt = Some(WorkspacePrompt::EnterName {
+            kind: WorkspaceEntryKind::Bookmark,
+            value: detail.table.display_name(),
+        });
+        self.status = "Type a bookmark name and press Enter.".into();
+    }
+
+    fn start_open_bookmark_prompt(&mut self) {
+        let bookmarks = self.config.sorted_bookmarks();
+        if bookmarks.is_empty() {
+            self.workspace_prompt = None;
+            self.status = "No saved bookmarks were found.".into();
+            return;
+        }
+
+        self.workspace_prompt = Some(WorkspacePrompt::OpenBookmark {
+            bookmarks,
+            index: 0,
+        });
+        self.status = "Choose a bookmark and press Enter.".into();
+    }
+
+    fn start_save_preset_prompt(&mut self) {
+        if self.detail_view != DetailView::Table {
+            self.status = "Filter presets are only available from the table detail view.".into();
+            return;
+        }
+        if self.active_filters().is_empty() {
+            self.status = "Add at least one filter before saving a preset.".into();
+            return;
+        }
+        let Some(detail) = self.detail.as_ref() else {
+            self.status = "Open a table detail first to save a preset.".into();
+            return;
+        };
+        if self.active_connection_target.is_none() {
+            self.status = "No active connection target is available for preset saving.".into();
+            return;
+        }
+
+        self.workspace_prompt = Some(WorkspacePrompt::EnterName {
+            kind: WorkspaceEntryKind::Preset,
+            value: format!("{} filters", detail.table.display_name()),
+        });
+        self.status = "Type a preset name and press Enter.".into();
+    }
+
+    fn start_apply_preset_prompt(&mut self) {
+        let Ok(connection) = self.active_connection_target() else {
+            self.status = "No active connection target is available for preset lookup.".into();
+            return;
+        };
+        let Some(detail) = self.detail.as_ref() else {
+            self.status = "Open a table detail first to apply a preset.".into();
+            return;
+        };
+
+        let presets = self
+            .config
+            .sorted_presets_for_scope(connection, &detail.table);
+        if presets.is_empty() {
+            self.workspace_prompt = None;
+            self.status = format!(
+                "No saved presets match {} on this connection.",
+                detail.table.display_name()
+            );
+            return;
+        }
+
+        self.workspace_prompt = Some(WorkspacePrompt::ApplyPreset { presets, index: 0 });
+        self.status = "Choose a preset and press Enter.".into();
+    }
+
+    async fn handle_workspace_prompt_key(&mut self, key: KeyEvent) -> Result<()> {
+        let Some(prompt) = self.workspace_prompt.clone() else {
+            return Ok(());
+        };
+
+        match prompt {
+            WorkspacePrompt::ChooseAction { actions, index } => match key.code {
+                KeyCode::Esc => {
+                    self.workspace_prompt = None;
+                    self.status = "Canceled workspace actions.".into();
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.workspace_prompt = Some(WorkspacePrompt::ChooseAction {
+                        index: move_index(index, actions.len(), -1),
+                        actions,
+                    });
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.workspace_prompt = Some(WorkspacePrompt::ChooseAction {
+                        index: move_index(index, actions.len(), 1),
+                        actions,
+                    });
+                }
+                KeyCode::Enter => {
+                    if let Some(action) = actions.get(index).copied() {
+                        self.start_workspace_action(action);
+                    }
+                }
+                _ => {
+                    self.workspace_prompt = Some(WorkspacePrompt::ChooseAction { actions, index });
+                }
+            },
+            WorkspacePrompt::EnterName { kind, mut value } => match key.code {
+                KeyCode::Esc => {
+                    self.workspace_prompt = None;
+                    self.status = format!("Canceled {} save.", kind.label());
+                }
+                KeyCode::Backspace => {
+                    value.pop();
+                    self.workspace_prompt = Some(WorkspacePrompt::EnterName { kind, value });
+                }
+                KeyCode::Enter => {
+                    let trimmed = value.trim().to_string();
+                    if trimmed.is_empty() {
+                        self.workspace_prompt = Some(WorkspacePrompt::EnterName { kind, value });
+                        self.status = format!(
+                            "Enter a non-empty {} name or press Esc to cancel.",
+                            kind.label()
+                        );
+                    } else if self.workspace_entry_exists(kind, &trimmed) {
+                        self.workspace_prompt = Some(WorkspacePrompt::ConfirmOverwrite {
+                            kind,
+                            value: trimmed,
+                        });
+                        self.status = format!(
+                            "A {} named '{}' already exists. Press Enter to overwrite or Esc to edit.",
+                            kind.label(),
+                            value.trim()
+                        );
+                    } else {
+                        self.save_workspace_entry(kind, trimmed).await?;
+                    }
+                }
+                KeyCode::Char(ch) => {
+                    value.push(ch);
+                    self.workspace_prompt = Some(WorkspacePrompt::EnterName { kind, value });
+                }
+                _ => {
+                    self.workspace_prompt = Some(WorkspacePrompt::EnterName { kind, value });
+                }
+            },
+            WorkspacePrompt::ConfirmOverwrite { kind, value } => match key.code {
+                KeyCode::Esc => {
+                    self.workspace_prompt = Some(WorkspacePrompt::EnterName { kind, value });
+                    self.status = format!("Returned to {} name entry.", kind.label());
+                }
+                KeyCode::Enter => self.save_workspace_entry(kind, value).await?,
+                _ => {
+                    self.workspace_prompt = Some(WorkspacePrompt::ConfirmOverwrite { kind, value });
+                }
+            },
+            WorkspacePrompt::OpenBookmark { bookmarks, index } => match key.code {
+                KeyCode::Esc => {
+                    self.workspace_prompt = None;
+                    self.status = "Canceled bookmark picker.".into();
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.workspace_prompt = Some(WorkspacePrompt::OpenBookmark {
+                        index: move_index(index, bookmarks.len(), -1),
+                        bookmarks,
+                    });
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.workspace_prompt = Some(WorkspacePrompt::OpenBookmark {
+                        index: move_index(index, bookmarks.len(), 1),
+                        bookmarks,
+                    });
+                }
+                KeyCode::Enter => {
+                    if let Some(bookmark) = bookmarks.get(index).cloned() {
+                        self.workspace_prompt = None;
+                        self.open_bookmark(bookmark).await?;
+                    }
+                }
+                _ => {
+                    self.workspace_prompt =
+                        Some(WorkspacePrompt::OpenBookmark { bookmarks, index });
+                }
+            },
+            WorkspacePrompt::ApplyPreset { presets, index } => match key.code {
+                KeyCode::Esc => {
+                    self.workspace_prompt = None;
+                    self.status = "Canceled preset picker.".into();
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.workspace_prompt = Some(WorkspacePrompt::ApplyPreset {
+                        index: move_index(index, presets.len(), -1),
+                        presets,
+                    });
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.workspace_prompt = Some(WorkspacePrompt::ApplyPreset {
+                        index: move_index(index, presets.len(), 1),
+                        presets,
+                    });
+                }
+                KeyCode::Enter => {
+                    if let Some(preset) = presets.get(index).cloned() {
+                        self.workspace_prompt = None;
+                        self.apply_filter_preset(preset).await?;
+                    }
+                }
+                _ => {
+                    self.workspace_prompt = Some(WorkspacePrompt::ApplyPreset { presets, index });
+                }
+            },
+        }
+
+        Ok(())
+    }
+
+    fn workspace_entry_exists(&self, kind: WorkspaceEntryKind, name: &str) -> bool {
+        match kind {
+            WorkspaceEntryKind::Bookmark => self.config.find_bookmark(name).is_some(),
+            WorkspaceEntryKind::Preset => {
+                let Ok(connection) = self.active_connection_target() else {
+                    return false;
+                };
+                let Some(detail) = self.detail.as_ref() else {
+                    return false;
+                };
+                self.config
+                    .find_filter_preset(connection, &detail.table, name)
+                    .is_some()
+            }
+        }
+    }
+
+    async fn save_workspace_entry(&mut self, kind: WorkspaceEntryKind, name: String) -> Result<()> {
+        match kind {
+            WorkspaceEntryKind::Bookmark => self.save_bookmark(name)?,
+            WorkspaceEntryKind::Preset => self.save_filter_preset(name)?,
+        }
+        self.workspace_prompt = None;
+        Ok(())
+    }
+
+    fn save_bookmark(&mut self, name: String) -> Result<()> {
+        let table = self
+            .detail
+            .as_ref()
+            .map(|detail| detail.table.clone())
+            .ok_or_else(|| anyhow!("bookmark saving requires an active table detail"))?;
+        let connection = self.active_connection_target()?.clone();
+        let replaced = self.config.upsert_bookmark(SavedBookmark {
+            name: name.clone(),
+            connection,
+            table,
+            preferred_view: Some(self.current_startup_view()),
+            filters: self.active_filters().to_vec(),
+            sort: self.current_sort(),
+        })?;
+        self.status = if replaced {
+            format!("Updated bookmark '{name}'.")
+        } else {
+            format!("Saved bookmark '{name}'.")
+        };
+        Ok(())
+    }
+
+    fn save_filter_preset(&mut self, name: String) -> Result<()> {
+        let table = self
+            .detail
+            .as_ref()
+            .map(|detail| detail.table.clone())
+            .ok_or_else(|| anyhow!("preset saving requires an active table detail"))?;
+        let connection = self.active_connection_target()?.clone();
+        let replaced = self.config.upsert_filter_preset(FilterPreset {
+            name: name.clone(),
+            connection,
+            table,
+            filters: self.active_filters().to_vec(),
+        })?;
+        self.status = if replaced {
+            format!("Updated preset '{name}'.")
+        } else {
+            format!("Saved preset '{name}'.")
+        };
+        Ok(())
+    }
+
+    async fn apply_filter_preset(&mut self, preset: FilterPreset) -> Result<()> {
+        let name = preset.name.clone();
+        let investigation = self.active_investigation_mut()?;
+        investigation.filters = preset.filters;
+        investigation.page = 0;
+        self.detail_filter_index = self.active_filters().len().saturating_sub(1);
+        self.detail_filter_prompt = None;
+        self.reload_preview().await?;
+        self.status = format!("Applied preset '{name}'.");
+        Ok(())
+    }
+
+    async fn open_bookmark(&mut self, bookmark: SavedBookmark) -> Result<()> {
+        let Some(profile) = self.config.resolve_connection_target(&bookmark.connection) else {
+            self.status = format!(
+                "Bookmark '{}' could not resolve {}.",
+                bookmark.name,
+                bookmark.connection.label()
+            );
+            return Ok(());
+        };
+
+        self.startup_target = Some(startup_target_from_bookmark(&bookmark));
+        if self.active_connection_target.as_ref() == Some(&bookmark.connection)
+            && self.session.is_some()
+        {
+            if self.session_kind() == Some(DatabaseKind::Postgres) {
+                self.schemas = self.session().unwrap().list_schemas().await?;
+                self.schema_index = 0;
+                self.screen = Screen::Schemas;
+                self.continue_startup_after_connect().await?;
+            } else {
+                self.load_tables(None).await?;
+                self.screen = Screen::Browser;
+                self.continue_startup_after_table_load().await?;
+            }
+        } else {
+            self.connect_candidate(ConnectionCandidate {
+                profile,
+                bookmark_target: bookmark.connection.clone(),
+                source: "bookmark",
+            })
+            .await?;
+        }
+
+        Ok(())
     }
 
     fn start_detail_export_prompt(&mut self) {
@@ -1255,10 +1771,15 @@ impl App {
             .cloned()
             .ok_or_else(|| anyhow!("no connection candidate is selected"))?;
 
+        self.connect_candidate(candidate).await
+    }
+
+    async fn connect_candidate(&mut self, candidate: ConnectionCandidate) -> Result<()> {
         self.status = format!("Connecting to {}...", candidate.profile.name);
         let session = Session::connect(&candidate.profile).await?;
         self.config.note_recent_profile(&candidate.profile.name)?;
         self.active_profile = Some(candidate.profile.clone());
+        self.active_connection_target = Some(candidate.bookmark_target.clone());
         self.session = Some(session);
         self.detail = None;
         self.active_investigation = None;
@@ -1266,6 +1787,7 @@ impl App {
         self.detail_filter_index = 0;
         self.detail_filter_prompt = None;
         self.detail_export_prompt = None;
+        self.workspace_prompt = None;
         self.detail_drill_actions = None;
         self.detail_drill_index = 0;
         self.detail_nav_stack.clear();
@@ -1319,6 +1841,7 @@ impl App {
         self.detail_filter_index = 0;
         self.detail_filter_prompt = None;
         self.detail_export_prompt = None;
+        self.workspace_prompt = None;
         self.detail_drill_actions = None;
         self.detail_drill_index = 0;
         self.detail_nav_stack.clear();
@@ -1377,6 +1900,7 @@ impl App {
         self.detail_filter_index = investigation.filters.len().saturating_sub(1);
         self.detail_filter_prompt = None;
         self.detail_export_prompt = None;
+        self.workspace_prompt = None;
         self.detail_drill_actions = None;
         self.detail_drill_index = 0;
         if clear_drill_stack {
@@ -1508,8 +2032,11 @@ impl App {
                     startup_view_label(view)
                 );
                 target.view = None;
-                self.store_startup_target(target);
+            } else {
+                target.filters.clear();
+                target.sort = None;
             }
+            self.store_startup_target(target);
             return Ok(());
         }
 
@@ -1523,13 +2050,24 @@ impl App {
             if let Some(view) = target.view {
                 target.table = None;
                 target.view = None;
+                let investigation = target.investigation_for_table(
+                    self.selected_table()
+                        .ok_or_else(|| anyhow!("target table selection is unavailable"))?,
+                );
+                target.filters.clear();
+                target.sort = None;
                 self.store_startup_target(target);
 
-                let table = self
-                    .selected_table()
-                    .ok_or_else(|| anyhow!("target table selection is unavailable"))?;
-                self.load_table_detail(table.clone(), startup_view_to_detail_view(view))
-                    .await?;
+                let table = investigation.table().clone();
+                self.open_detail_context(
+                    DetailNavStackEntry {
+                        investigation,
+                        selected_row: 0,
+                    },
+                    startup_view_to_detail_view(view),
+                    true,
+                )
+                .await?;
                 self.status = format!(
                     "Opened {} in {} view.",
                     table.display_name(),
@@ -1551,6 +2089,8 @@ impl App {
             );
             target.table = None;
             target.view = None;
+            target.filters.clear();
+            target.sort = None;
             self.store_startup_target(target);
         }
 
@@ -1571,10 +2111,24 @@ impl App {
             .and_then(|investigation| investigation.sort.clone())
     }
 
+    fn active_connection_target(&self) -> Result<&BookmarkConnectionTarget> {
+        self.active_connection_target
+            .as_ref()
+            .ok_or_else(|| anyhow!("no active connection target is loaded"))
+    }
+
+    fn current_startup_view(&self) -> StartupView {
+        match self.detail_view {
+            DetailView::Table => StartupView::Detail,
+            DetailView::Graph => StartupView::Graph,
+        }
+    }
+
     fn is_input_mode_active(&self) -> bool {
         self.table_search_mode
             || self.detail_filter_prompt.is_some()
             || self.detail_export_prompt.is_some()
+            || self.workspace_prompt.is_some()
             || self.detail_drill_actions.is_some()
     }
 
@@ -1592,9 +2146,49 @@ impl App {
             Screen::Connections => "Enter connect | Esc quit | q quit",
             Screen::Schemas => "Enter open schema | Esc back | q quit",
             Screen::Browser if self.table_search_mode => "Type filter | Enter apply | Esc clear",
-            Screen::Browser => "Enter detail | / filter | r reload | Esc back | q quit",
+            Screen::Browser
+                if matches!(
+                    self.workspace_prompt,
+                    Some(WorkspacePrompt::EnterName { .. })
+                ) =>
+            {
+                "Type name | Enter save | Esc cancel"
+            }
+            Screen::Browser
+                if matches!(
+                    self.workspace_prompt,
+                    Some(WorkspacePrompt::ConfirmOverwrite { .. })
+                ) =>
+            {
+                "Enter overwrite | Esc edit name"
+            }
+            Screen::Browser if self.workspace_prompt.is_some() => {
+                "Up/Down move | Enter confirm | Esc cancel"
+            }
+            Screen::Browser => {
+                "Enter detail | / filter | b bookmarks | r reload | Esc back | q quit"
+            }
+            Screen::Detail
+                if matches!(
+                    self.workspace_prompt,
+                    Some(WorkspacePrompt::EnterName { .. })
+                ) =>
+            {
+                "Type name | Enter save | Esc cancel"
+            }
+            Screen::Detail
+                if matches!(
+                    self.workspace_prompt,
+                    Some(WorkspacePrompt::ConfirmOverwrite { .. })
+                ) =>
+            {
+                "Enter overwrite | Esc edit name"
+            }
+            Screen::Detail if self.workspace_prompt.is_some() => {
+                "Up/Down move | Enter confirm | Esc cancel"
+            }
             Screen::Detail if self.detail_view == DetailView::Graph => {
-                "Left/Right lane | Up/Down move-or-scroll | Enter center neighbor | g/Esc detail | r reload | q quit"
+                "Left/Right lane | Up/Down move-or-scroll | Enter center neighbor | b workspace | g/Esc detail | r reload | q quit"
             }
             Screen::Detail
                 if matches!(
@@ -1627,7 +2221,7 @@ impl App {
                 "Up/Down move | Enter open relation | Esc cancel"
             }
             Screen::Detail => {
-                "Up/Down row | Enter relations | e export | f add filter | h/l pick filter | x remove | c clear | [ ] sort | s order | n/p page | g graph | Esc back | q quit"
+                "Up/Down row | Enter relations | b workspace | e export | f add filter | h/l pick filter | x remove | c clear | [ ] sort | s order | n/p page | g graph | Esc back | q quit"
             }
         }
     }
@@ -1759,6 +2353,9 @@ impl App {
             .block(Block::default().title("Browser").borders(Borders::ALL))
             .wrap(Wrap { trim: false });
         frame.render_widget(panel, body[1]);
+        if let Some(prompt) = &self.workspace_prompt {
+            self.render_workspace_prompt(frame, chunks[0], prompt);
+        }
         frame.render_widget(status_bar(&self.status, self.controls_hint()), chunks[1]);
     }
 
@@ -1777,6 +2374,9 @@ impl App {
 
         if self.detail_view == DetailView::Graph {
             self.render_graph_detail(frame, chunks[0], detail);
+            if let Some(prompt) = &self.workspace_prompt {
+                self.render_workspace_prompt(frame, chunks[0], prompt);
+            }
             frame.render_widget(status_bar(&self.status, self.controls_hint()), chunks[1]);
             return;
         }
@@ -1881,10 +2481,114 @@ impl App {
         if let Some(prompt) = &self.detail_export_prompt {
             self.render_detail_export_prompt(frame, chunks[0], prompt);
         }
+        if let Some(prompt) = &self.workspace_prompt {
+            self.render_workspace_prompt(frame, chunks[0], prompt);
+        }
         if let Some(actions) = &self.detail_drill_actions {
             self.render_detail_drill_prompt(frame, chunks[0], actions);
         }
         frame.render_widget(status_bar(&self.status, self.controls_hint()), chunks[1]);
+    }
+
+    fn render_workspace_prompt(&self, frame: &mut Frame, area: Rect, prompt: &WorkspacePrompt) {
+        match prompt {
+            WorkspacePrompt::ChooseAction { actions, index } => {
+                let popup = centered_rect(48, 10, area);
+                frame.render_widget(Clear, popup);
+                let items = actions
+                    .iter()
+                    .map(|action| ListItem::new(action.label()))
+                    .collect::<Vec<_>>();
+                let mut state = ListState::default();
+                state.select(Some(*index));
+                let list = List::new(items)
+                    .block(Block::default().title("Workspace").borders(Borders::ALL))
+                    .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+                frame.render_stateful_widget(list, popup, &mut state);
+            }
+            WorkspacePrompt::EnterName { kind, value } => {
+                let popup = centered_rect(68, 8, area);
+                frame.render_widget(Clear, popup);
+                let widget = Paragraph::new(vec![
+                    Line::from(format!("Save {}.", kind.label())),
+                    Line::from("Edit the name and press Enter to save."),
+                    Line::from(""),
+                    Line::from(format!("Name: {value}")),
+                ])
+                .block(
+                    Block::default()
+                        .title(format!("Save {}", kind.label()))
+                        .borders(Borders::ALL),
+                )
+                .wrap(Wrap { trim: false });
+                frame.render_widget(widget, popup);
+            }
+            WorkspacePrompt::ConfirmOverwrite { kind, value } => {
+                let popup = centered_rect(68, 8, area);
+                frame.render_widget(Clear, popup);
+                let widget = Paragraph::new(vec![
+                    Line::from("This name already exists."),
+                    Line::from("Press Enter to overwrite or Esc to return."),
+                    Line::from(""),
+                    Line::from(format!("Name: {value}")),
+                ])
+                .block(
+                    Block::default()
+                        .title(format!("Overwrite {}?", kind.label()))
+                        .borders(Borders::ALL),
+                )
+                .wrap(Wrap { trim: false });
+                frame.render_widget(widget, popup);
+            }
+            WorkspacePrompt::OpenBookmark { bookmarks, index } => {
+                let popup = centered_rect(72, 14, area);
+                frame.render_widget(Clear, popup);
+                let items = bookmarks
+                    .iter()
+                    .map(|bookmark| {
+                        let target = match &bookmark.table.schema {
+                            Some(schema) => format!("{}.{}", schema, bookmark.table.name),
+                            None => bookmark.table.name.clone(),
+                        };
+                        let view = bookmark
+                            .preferred_view
+                            .map(startup_view_label)
+                            .unwrap_or("detail");
+                        ListItem::new(format!("{} [{} | {}]", bookmark.name, target, view))
+                    })
+                    .collect::<Vec<_>>();
+                let mut state = ListState::default();
+                state.select(Some(*index));
+                let list = List::new(items)
+                    .block(Block::default().title("Bookmarks").borders(Borders::ALL))
+                    .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+                frame.render_stateful_widget(list, popup, &mut state);
+            }
+            WorkspacePrompt::ApplyPreset { presets, index } => {
+                let popup = centered_rect(72, 14, area);
+                frame.render_widget(Clear, popup);
+                let items = presets
+                    .iter()
+                    .map(|preset| {
+                        ListItem::new(format!(
+                            "{} [{} filters]",
+                            preset.name,
+                            preset.filters.len()
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                let mut state = ListState::default();
+                state.select(Some(*index));
+                let list = List::new(items)
+                    .block(
+                        Block::default()
+                            .title("Filter Presets")
+                            .borders(Borders::ALL),
+                    )
+                    .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+                frame.render_stateful_widget(list, popup, &mut state);
+            }
+        }
     }
 
     fn render_detail_export_prompt(
@@ -2570,42 +3274,33 @@ fn build_candidates(
     args: &CliArgs,
     config: &ConfigStore,
     mcp_context: Option<&McpContext>,
+    bookmark_defaults: &BookmarkDefaults,
 ) -> (Vec<ConnectionCandidate>, usize, bool) {
     let mut candidates = config
         .ordered_profiles()
         .into_iter()
         .map(|profile| ConnectionCandidate {
+            bookmark_target: BookmarkConnectionTarget::SavedProfile {
+                name: profile.name.clone(),
+            },
             profile,
             source: "saved",
         })
         .collect::<Vec<_>>();
 
-    if let Some(url) = &args.pg_url {
+    if let Some(profile) = bookmark_defaults.mcp_profile() {
+        let bookmark_target = bookmark_defaults
+            .mcp_bookmark()
+            .map(|bookmark| bookmark.connection.clone())
+            .unwrap_or_else(|| BookmarkConnectionTarget::Direct {
+                profile: profile.clone(),
+            });
         candidates.insert(
             0,
             ConnectionCandidate {
-                profile: ConnectionProfile {
-                    name: "cli-postgres".into(),
-                    kind: DatabaseKind::Postgres,
-                    url: Some(url.clone()),
-                    path: None,
-                },
-                source: "cli",
-            },
-        );
-    }
-
-    if let Some(path) = &args.sqlite_path {
-        candidates.insert(
-            0,
-            ConnectionCandidate {
-                profile: ConnectionProfile {
-                    name: "cli-sqlite".into(),
-                    kind: DatabaseKind::Sqlite,
-                    url: None,
-                    path: Some(path.clone()),
-                },
-                source: "cli",
+                profile: profile.clone(),
+                bookmark_target,
+                source: "bookmark",
             },
         );
     }
@@ -2615,11 +3310,69 @@ fn build_candidates(
             candidates.insert(
                 0,
                 ConnectionCandidate {
+                    bookmark_target: BookmarkConnectionTarget::Direct {
+                        profile: profile.clone(),
+                    },
                     profile,
                     source: "mcp",
                 },
             );
         }
+    }
+
+    if let Some(profile) = bookmark_defaults.cli_profile() {
+        let bookmark_target = bookmark_defaults
+            .cli_bookmark()
+            .map(|bookmark| bookmark.connection.clone())
+            .unwrap_or_else(|| BookmarkConnectionTarget::Direct {
+                profile: profile.clone(),
+            });
+        candidates.insert(
+            0,
+            ConnectionCandidate {
+                profile: profile.clone(),
+                bookmark_target,
+                source: "bookmark",
+            },
+        );
+    }
+
+    if let Some(url) = &args.pg_url {
+        let profile = ConnectionProfile {
+            name: "cli-postgres".into(),
+            kind: DatabaseKind::Postgres,
+            url: Some(url.clone()),
+            path: None,
+        };
+        candidates.insert(
+            0,
+            ConnectionCandidate {
+                bookmark_target: BookmarkConnectionTarget::Direct {
+                    profile: profile.clone(),
+                },
+                profile,
+                source: "cli",
+            },
+        );
+    }
+
+    if let Some(path) = &args.sqlite_path {
+        let profile = ConnectionProfile {
+            name: "cli-sqlite".into(),
+            kind: DatabaseKind::Sqlite,
+            url: None,
+            path: Some(path.clone()),
+        };
+        candidates.insert(
+            0,
+            ConnectionCandidate {
+                bookmark_target: BookmarkConnectionTarget::Direct {
+                    profile: profile.clone(),
+                },
+                profile,
+                source: "cli",
+            },
+        );
     }
 
     let selected_index = args
@@ -2634,32 +3387,166 @@ fn build_candidates(
     let pending_auto_connect = args.profile.is_some()
         || args.pg_url.is_some()
         || args.sqlite_path.is_some()
+        || bookmark_defaults.cli.is_some()
         || mcp_context
             .and_then(|context| context.profile.as_ref())
-            .is_some();
+            .is_some()
+        || bookmark_defaults.mcp.is_some();
 
     (candidates, selected_index, pending_auto_connect)
 }
 
-fn build_startup_target(args: &CliArgs, mcp_context: Option<&McpContext>) -> Option<StartupTarget> {
-    let target = StartupTarget {
+fn build_startup_target(
+    args: &CliArgs,
+    mcp_context: Option<&McpContext>,
+    bookmark_defaults: &BookmarkDefaults,
+) -> Option<StartupTarget> {
+    let cli_explicit_connection =
+        args.profile.is_some() || args.pg_url.is_some() || args.sqlite_path.is_some();
+    let cli_explicit_target = args.schema.is_some() || args.table.is_some();
+    let mcp_explicit_connection = mcp_context
+        .and_then(|context| context.profile.as_ref())
+        .is_some();
+    let mcp_explicit_target = mcp_context
+        .and_then(|context| context.target_schema.as_ref())
+        .is_some()
+        || mcp_context
+            .and_then(|context| context.target_table.as_ref())
+            .is_some();
+    let bookmark_query_state = if let Some(bookmark) = bookmark_defaults.cli_bookmark() {
+        if !cli_explicit_connection && !cli_explicit_target {
+            (bookmark.filters.clone(), bookmark.sort.clone())
+        } else {
+            (Vec::new(), None)
+        }
+    } else if let Some(bookmark) = bookmark_defaults.mcp_bookmark() {
+        if args.bookmark.is_none()
+            && !cli_explicit_connection
+            && !cli_explicit_target
+            && !mcp_explicit_connection
+            && !mcp_explicit_target
+        {
+            (bookmark.filters.clone(), bookmark.sort.clone())
+        } else {
+            (Vec::new(), None)
+        }
+    } else {
+        (Vec::new(), None)
+    };
+
+    let mut target = StartupTarget {
         schema: args
             .schema
             .clone()
-            .or_else(|| mcp_context.and_then(|context| context.target_schema.clone())),
+            .or_else(|| {
+                bookmark_defaults
+                    .cli_bookmark()
+                    .and_then(|bookmark| bookmark.table.schema.clone())
+            })
+            .or_else(|| mcp_context.and_then(|context| context.target_schema.clone()))
+            .or_else(|| {
+                bookmark_defaults
+                    .mcp_bookmark()
+                    .and_then(|bookmark| bookmark.table.schema.clone())
+            }),
         table: args
             .table
             .clone()
-            .or_else(|| mcp_context.and_then(|context| context.target_table.clone())),
+            .or_else(|| {
+                bookmark_defaults
+                    .cli_bookmark()
+                    .map(|bookmark| bookmark.table.name.clone())
+            })
+            .or_else(|| mcp_context.and_then(|context| context.target_table.clone()))
+            .or_else(|| {
+                bookmark_defaults
+                    .mcp_bookmark()
+                    .map(|bookmark| bookmark.table.name.clone())
+            }),
         view: args
             .view
-            .or_else(|| mcp_context.and_then(|context| context.target_view)),
+            .or_else(|| {
+                bookmark_defaults
+                    .cli_bookmark()
+                    .and_then(|bookmark| bookmark.preferred_view)
+            })
+            .or_else(|| mcp_context.and_then(|context| context.target_view))
+            .or_else(|| {
+                bookmark_defaults
+                    .mcp_bookmark()
+                    .and_then(|bookmark| bookmark.preferred_view)
+            }),
+        filters: bookmark_query_state.0,
+        sort: bookmark_query_state.1,
     };
+
+    if target.view.is_none() && (!target.filters.is_empty() || target.sort.is_some()) {
+        target.view = Some(StartupView::Detail);
+    }
+
     if target.is_empty() {
         None
     } else {
         Some(target)
     }
+}
+
+fn startup_target_from_bookmark(bookmark: &SavedBookmark) -> StartupTarget {
+    let mut target = StartupTarget {
+        schema: bookmark.table.schema.clone(),
+        table: Some(bookmark.table.name.clone()),
+        view: bookmark.preferred_view,
+        filters: bookmark.filters.clone(),
+        sort: bookmark.sort.clone(),
+    };
+
+    if target.view.is_none() && (!target.filters.is_empty() || target.sort.is_some()) {
+        target.view = Some(StartupView::Detail);
+    }
+
+    target
+}
+
+fn resolve_bookmark_defaults(
+    args: &CliArgs,
+    config: &ConfigStore,
+    mcp_context: Option<&McpContext>,
+) -> BookmarkDefaults {
+    let mut warnings = Vec::new();
+    let cli = args
+        .bookmark
+        .as_deref()
+        .and_then(|name| resolve_named_bookmark(config, name, &mut warnings));
+    let mcp = mcp_context
+        .and_then(|context| context.target_bookmark.as_deref())
+        .and_then(|name| resolve_named_bookmark(config, name, &mut warnings));
+
+    BookmarkDefaults {
+        cli,
+        mcp,
+        warning: (!warnings.is_empty()).then(|| warnings.join(" ")),
+    }
+}
+
+fn resolve_named_bookmark(
+    config: &ConfigStore,
+    name: &str,
+    warnings: &mut Vec<String>,
+) -> Option<BookmarkStartupContext> {
+    let Some(bookmark) = config.find_bookmark(name) else {
+        warnings.push(format!("Bookmark '{name}' was not found."));
+        return None;
+    };
+
+    let Some(profile) = config.resolve_connection_target(&bookmark.connection) else {
+        warnings.push(format!(
+            "Bookmark '{}' could not resolve its connection target.",
+            bookmark.name
+        ));
+        return None;
+    };
+
+    Some(BookmarkStartupContext { bookmark, profile })
 }
 
 fn startup_view_to_detail_view(view: StartupView) -> DetailView {
@@ -2837,6 +3724,7 @@ mod tests {
             schema: None,
             table: None,
             view: None,
+            bookmark: None,
             mcp_context_file: None,
         }
     }
@@ -2861,6 +3749,9 @@ mod tests {
                     url: None,
                     path: Some(PathBuf::from("sample.db")),
                 },
+                bookmark_target: BookmarkConnectionTarget::SavedProfile {
+                    name: "sample".into(),
+                },
                 source: "saved",
             }],
             connection_index: 0,
@@ -2875,6 +3766,7 @@ mod tests {
             table_search_mode: search_mode,
             session: None,
             active_profile: None,
+            active_connection_target: None,
             active_schema: None,
             detail: None,
             active_investigation: None,
@@ -2882,6 +3774,7 @@ mod tests {
             detail_filter_index: 0,
             detail_filter_prompt: None,
             detail_export_prompt: None,
+            workspace_prompt: None,
             detail_drill_actions: None,
             detail_drill_index: 0,
             detail_nav_stack: Vec::new(),
@@ -2928,6 +3821,7 @@ mod tests {
                 url: None,
                 path: Some(PathBuf::from("sample/readgrid_demo.db")),
             }),
+            target_bookmark: None,
             target_schema: Some("mcp_schema".into()),
             target_table: Some("mcp_table".into()),
             target_view: Some(StartupView::Graph),
@@ -3044,7 +3938,12 @@ mod tests {
         args.schema = Some("cli_schema".into());
         args.table = Some("cli_table".into());
         args.view = Some(StartupView::Detail);
-        let target = build_startup_target(&args, Some(&sample_mcp_context())).unwrap();
+        let target = build_startup_target(
+            &args,
+            Some(&sample_mcp_context()),
+            &BookmarkDefaults::default(),
+        )
+        .unwrap();
 
         assert_eq!(target.schema.as_deref(), Some("cli_schema"));
         assert_eq!(target.table.as_deref(), Some("cli_table"));
@@ -3053,7 +3952,12 @@ mod tests {
 
     #[test]
     fn build_startup_target_uses_mcp_fields_when_cli_is_missing() {
-        let target = build_startup_target(&test_args(), Some(&sample_mcp_context())).unwrap();
+        let target = build_startup_target(
+            &test_args(),
+            Some(&sample_mcp_context()),
+            &BookmarkDefaults::default(),
+        )
+        .unwrap();
 
         assert_eq!(target.schema.as_deref(), Some("mcp_schema"));
         assert_eq!(target.table.as_deref(), Some("mcp_table"));
@@ -3063,10 +3967,61 @@ mod tests {
     #[test]
     fn build_candidates_auto_connects_for_mcp_profile() {
         let config = test_config();
-        let (_, _, pending_auto_connect) =
-            build_candidates(&test_args(), &config, Some(&sample_mcp_context()));
+        let (_, _, pending_auto_connect) = build_candidates(
+            &test_args(),
+            &config,
+            Some(&sample_mcp_context()),
+            &BookmarkDefaults::default(),
+        );
 
         assert!(pending_auto_connect);
+    }
+
+    #[test]
+    fn build_startup_target_uses_bookmark_query_state_when_bookmark_is_base_context() {
+        let defaults = BookmarkDefaults {
+            cli: Some(BookmarkStartupContext {
+                profile: ConnectionProfile {
+                    name: "sample".into(),
+                    kind: DatabaseKind::Sqlite,
+                    url: None,
+                    path: Some(PathBuf::from("sample/readgrid_demo.db")),
+                },
+                bookmark: sample_saved_bookmark(),
+            }),
+            ..BookmarkDefaults::default()
+        };
+
+        let target = build_startup_target(&test_args(), None, &defaults).unwrap();
+
+        assert_eq!(target.table.as_deref(), Some("tasks"));
+        assert_eq!(target.view, Some(StartupView::Graph));
+        assert_eq!(target.filters.len(), 1);
+        assert_eq!(target.sort.as_ref().unwrap().column_name, "title");
+    }
+
+    #[test]
+    fn build_startup_target_drops_bookmark_query_state_when_table_is_overridden() {
+        let mut args = test_args();
+        args.table = Some("projects".into());
+        let defaults = BookmarkDefaults {
+            cli: Some(BookmarkStartupContext {
+                profile: ConnectionProfile {
+                    name: "sample".into(),
+                    kind: DatabaseKind::Sqlite,
+                    url: None,
+                    path: Some(PathBuf::from("sample/readgrid_demo.db")),
+                },
+                bookmark: sample_saved_bookmark(),
+            }),
+            ..BookmarkDefaults::default()
+        };
+
+        let target = build_startup_target(&args, None, &defaults).unwrap();
+
+        assert_eq!(target.table.as_deref(), Some("projects"));
+        assert!(target.filters.is_empty());
+        assert!(target.sort.is_none());
     }
 
     #[test]
@@ -3139,17 +4094,39 @@ mod tests {
         ))
     }
 
-    fn temp_export_path(name: &str, extension: &str) -> PathBuf {
+    fn temp_state_path(name: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "readgrid_app_{name}_{}_{}.{}",
+            "readgrid_app_{name}_{}_{}.toml",
             std::process::id(),
-            unique,
-            extension
+            unique
         ))
+    }
+
+    fn sample_saved_bookmark() -> SavedBookmark {
+        SavedBookmark {
+            name: "tasks-focus".into(),
+            connection: BookmarkConnectionTarget::SavedProfile {
+                name: "sample".into(),
+            },
+            table: TableRef {
+                schema: None,
+                name: "tasks".into(),
+            },
+            preferred_view: Some(StartupView::Graph),
+            filters: vec![PreviewFilter {
+                column_name: "title".into(),
+                operator: FilterOperator::Contains,
+                value: Some("Build".into()),
+            }],
+            sort: Some(SortState {
+                column_name: "title".into(),
+                descending: true,
+            }),
+        }
     }
 
     #[test]
@@ -3717,6 +4694,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn save_bookmark_persists_current_detail_context() {
+        let mut app = test_app(Screen::Detail, false);
+        app.config.state_path = temp_state_path("bookmark_save");
+        seed_sample_detail_state(&mut app, 0);
+        app.active_connection_target = Some(BookmarkConnectionTarget::SavedProfile {
+            name: "sample".into(),
+        });
+
+        app.start_save_bookmark_prompt();
+        app.handle_workspace_prompt_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let bookmark = app.config.find_bookmark("tasks").unwrap();
+        assert_eq!(bookmark.table.name, "tasks");
+        assert_eq!(bookmark.preferred_view, Some(StartupView::Detail));
+        assert_eq!(
+            bookmark.connection,
+            app.active_connection_target.clone().unwrap()
+        );
+        fs::remove_file(&app.config.state_path).ok();
+    }
+
+    #[tokio::test]
+    async fn applying_preset_replaces_filters_and_resets_page() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("sample")
+            .join("readgrid_demo.db");
+        let session = Session::connect(&ConnectionProfile {
+            name: "sample".into(),
+            kind: DatabaseKind::Sqlite,
+            url: None,
+            path: Some(path),
+        })
+        .await
+        .unwrap();
+
+        let mut app = test_app(Screen::Detail, false);
+        app.session = Some(session);
+        app.active_connection_target = Some(BookmarkConnectionTarget::SavedProfile {
+            name: "sample".into(),
+        });
+        app.detail = Some(sample_graph_detail());
+        app.active_investigation = Some(InvestigationState {
+            source: InvestigationSource::Table(TableRef {
+                schema: None,
+                name: "tasks".into(),
+            }),
+            sort: Some(SortState {
+                column_name: "id".into(),
+                descending: false,
+            }),
+            filters: vec![PreviewFilter {
+                column_name: "id".into(),
+                operator: FilterOperator::Equals,
+                value: Some("1".into()),
+            }],
+            page: 2,
+        });
+        app.config.state.filter_presets.push(FilterPreset {
+            name: "build-only".into(),
+            connection: BookmarkConnectionTarget::SavedProfile {
+                name: "sample".into(),
+            },
+            table: TableRef {
+                schema: None,
+                name: "tasks".into(),
+            },
+            filters: vec![PreviewFilter {
+                column_name: "title".into(),
+                operator: FilterOperator::Contains,
+                value: Some("Build".into()),
+            }],
+        });
+
+        app.start_apply_preset_prompt();
+        app.handle_workspace_prompt_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let investigation = app.active_investigation.as_ref().unwrap();
+        assert_eq!(investigation.page, 0);
+        assert_eq!(investigation.filters.len(), 1);
+        assert_eq!(investigation.filters[0].column_name, "title");
+        assert_eq!(app.status, "Applied preset 'build-only'.");
+    }
+
+    #[tokio::test]
     async fn up_down_moves_preview_row_selection() {
         let mut app = test_app(Screen::Detail, false);
         app.detail = Some(sample_graph_detail());
@@ -4230,6 +5295,8 @@ mod tests {
             schema: Some("ignored".into()),
             table: Some("tasks".into()),
             view: None,
+            filters: Vec::new(),
+            sort: None,
         });
 
         app.load_tables(None).await.unwrap();
@@ -4262,6 +5329,8 @@ mod tests {
             schema: None,
             table: Some("tasks".into()),
             view: Some(StartupView::Detail),
+            filters: Vec::new(),
+            sort: None,
         });
 
         app.load_tables(None).await.unwrap();
@@ -4295,6 +5364,8 @@ mod tests {
             schema: None,
             table: Some("tasks".into()),
             view: Some(StartupView::Graph),
+            filters: Vec::new(),
+            sort: None,
         });
 
         app.load_tables(None).await.unwrap();
@@ -4317,6 +5388,8 @@ mod tests {
             schema: Some("missing".into()),
             table: Some("tasks".into()),
             view: Some(StartupView::Detail),
+            filters: Vec::new(),
+            sort: None,
         });
 
         app.continue_startup_after_connect().await.unwrap();
@@ -4356,6 +5429,8 @@ mod tests {
             schema: None,
             table: None,
             view: Some(StartupView::Graph),
+            filters: Vec::new(),
+            sort: None,
         });
 
         app.load_tables(None).await.unwrap();

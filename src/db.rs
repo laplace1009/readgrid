@@ -28,7 +28,7 @@ impl fmt::Display for DatabaseKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConnectionProfile {
     pub name: String,
     pub kind: DatabaseKind,
@@ -63,7 +63,7 @@ impl ConnectionProfile {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct TableRef {
     pub schema: Option<String>,
     pub name: String,
@@ -141,13 +141,14 @@ pub struct TableDetail {
     pub indexes: Vec<IndexMeta>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SortState {
     pub column_name: String,
     pub descending: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum FilterOperator {
     Equals,
     NotEquals,
@@ -183,7 +184,7 @@ impl FilterOperator {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PreviewFilter {
     pub column_name: String,
     pub operator: FilterOperator,

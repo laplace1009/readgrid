@@ -28,12 +28,13 @@ cargo run -- --profile local-postgres
 cargo run -- --sqlite-path sample/readgrid_demo.db --table tasks
 cargo run -- --sqlite-path sample/readgrid_demo.db --table tasks --view detail
 cargo run -- --profile local-postgres --schema public --table tasks --view graph
+cargo run -- --bookmark tasks-focus
 ```
 
 CLI 형식:
 
 ```text
-readgrid [--profile NAME | --pg-url URL | --sqlite-path PATH] [--schema NAME] [--table NAME] [--view detail|graph] [--mcp-context-file PATH]
+readgrid [--profile NAME | --pg-url URL | --sqlite-path PATH] [--schema NAME] [--table NAME] [--view detail|graph] [--bookmark NAME] [--mcp-context-file PATH]
 ```
 
 ### 프로필 설정
@@ -52,6 +53,8 @@ kind = "sqlite"
 path = "./sample.db"
 ```
 
+작업공간 상태는 같은 디렉터리의 `state.toml`에 저장됩니다. 최근 프로필과 함께 북마크, 테이블별 필터 프리셋도 여기에 보관됩니다.
+
 ### MCP 컨텍스트 전달
 
 다음 세 가지 방법으로 미리 선택된 연결 정보를 넘길 수 있습니다.
@@ -63,18 +66,19 @@ path = "./sample.db"
 예시 JSON:
 
 ```json
-{"profile":{"name":"sample-sqlite","kind":"sqlite","path":"sample/readgrid_demo.db"},"target_schema":null,"target_table":"tasks","target_view":"detail"}
+{"profile":{"name":"sample-sqlite","kind":"sqlite","path":"sample/readgrid_demo.db"},"target_bookmark":"tasks-focus","target_schema":null,"target_table":"tasks","target_view":"detail"}
 ```
 
 기존 `preferred_schema` 키도 계속 읽을 수 있으며, `target_schema`의 별칭으로 처리됩니다.
 
 ### 딥 링크 시작 동작
 
-- `--schema`, `--table`, `--view`는 CLI에서 MCP 컨텍스트보다 우선합니다.
+- `--schema`, `--table`, `--view`, `--bookmark`는 CLI에서 MCP 컨텍스트보다 우선합니다.
 - `--view`를 생략하면 브라우저 화면에서 대상 테이블만 선택합니다.
 - PostgreSQL에서 테이블이나 뷰를 바로 열려면 스키마가 필요합니다. 스키마가 없으면 스키마 선택 화면에서 멈추고 안내 메시지를 보여줍니다.
 - SQLite에서는 스키마 힌트를 무시하고 테이블/뷰 대상으로 바로 이어갑니다.
 - 잘못된 스키마나 테이블을 요청하면 가장 가까운 유효 화면으로 돌아가고 상태 줄에 이유를 표시합니다.
+- `--bookmark`는 저장된 연결, 테이블, 필터, 정렬, 선호 뷰를 기본값으로 불러오고, 명시적인 CLI 타깃 값이 있으면 그 값으로 덮어씁니다.
 
 ### 데모 데이터베이스
 
@@ -89,10 +93,9 @@ sqlite3 sample/readgrid_demo.db < sample/readgrid_demo.sql
 
 - 연결 화면: `Enter` 연결, `Esc` 또는 `q` 종료
 - 테이블 브라우저: `/` 필터, `r` 새로고침, `Enter` 상세 보기
-- 상세 화면: `e` 내보내기, `f` 필터 추가, `[` `]` 정렬 컬럼 이동, `s` 정렬 방향 전환, `n` `p` 페이지 이동, `Enter` 관계 이동, `g` 관계 그래프, `Esc` 뒤로
-- 내보내기 팝업에서는 `Tab`으로 범위(`visible page`/`all matching rows`)를 바꾸고, 제안 경로를 아직 수정하지 않았다면 `f`로 형식(`CSV`/`JSON`)을 바꿉니다.
-- JSON 내보내기는 컬럼 이름을 키로 쓰는 객체 배열을 기록하며, DB `NULL` 값은 문자열 `"NULL"`이 아니라 JSON `null`로 저장됩니다.
-- 기본 제안 경로는 계속 `db_csv/` 아래를 사용하며, 형식과 범위에 따라 `tasks.csv`, `tasks_all.csv`, `tasks.json`, `tasks_all.json`처럼 파일명이 달라집니다.
+- 상세 화면: `b` 작업공간 메뉴, `e` CSV 내보내기, `f` 필터 추가, `[` `]` 정렬 컬럼 이동, `s` 정렬 방향 전환, `n` `p` 페이지 이동, `Enter` 관계 이동, `g` 관계 그래프, `Esc` 뒤로
+- 작업공간 메뉴: 북마크 저장/열기, 현재 테이블 필터 프리셋 저장/적용
+- CSV 내보내기는 현재 화면에 보이는 미리보기 페이지 한 장만 저장하며, 기본 경로는 `db_csv/` 아래에 제안됩니다.
 
 ### 개발
 
@@ -128,12 +131,13 @@ cargo run -- --profile local-postgres
 cargo run -- --sqlite-path sample/readgrid_demo.db --table tasks
 cargo run -- --sqlite-path sample/readgrid_demo.db --table tasks --view detail
 cargo run -- --profile local-postgres --schema public --table tasks --view graph
+cargo run -- --bookmark tasks-focus
 ```
 
 CLI shape:
 
 ```text
-readgrid [--profile NAME | --pg-url URL | --sqlite-path PATH] [--schema NAME] [--table NAME] [--view detail|graph] [--mcp-context-file PATH]
+readgrid [--profile NAME | --pg-url URL | --sqlite-path PATH] [--schema NAME] [--table NAME] [--view detail|graph] [--bookmark NAME] [--mcp-context-file PATH]
 ```
 
 ### Profiles
@@ -152,6 +156,8 @@ kind = "sqlite"
 path = "./sample.db"
 ```
 
+Workspace state is saved alongside profiles in `state.toml`. That file now stores bookmarks and table-scoped filter presets in addition to recent profiles.
+
 ### MCP Context Handoff
 
 You can provide a preselected connection with any of the following:
@@ -163,18 +169,19 @@ You can provide a preselected connection with any of the following:
 Example JSON:
 
 ```json
-{"profile":{"name":"sample-sqlite","kind":"sqlite","path":"sample/readgrid_demo.db"},"target_schema":null,"target_table":"tasks","target_view":"detail"}
+{"profile":{"name":"sample-sqlite","kind":"sqlite","path":"sample/readgrid_demo.db"},"target_bookmark":"tasks-focus","target_schema":null,"target_table":"tasks","target_view":"detail"}
 ```
 
 The legacy `preferred_schema` key is still accepted as an alias for `target_schema`.
 
 ### Deep-Link Startup
 
-- `--schema`, `--table`, and `--view` from the CLI override matching MCP target fields.
+- `--schema`, `--table`, `--view`, and `--bookmark` from the CLI override matching MCP target fields.
 - Omitting `--view` keeps ReadGrid in the browser and simply preselects the requested table.
 - PostgreSQL needs a schema before it can open a specific table or view, so missing schemas fall back to the schema picker with a status message.
 - SQLite ignores schema hints and continues directly to the requested table or view.
 - Invalid schemas or tables fall back to the nearest valid screen and explain the reason in the status line.
+- `--bookmark` restores the saved connection, table, filters, sort, and preferred view as the base context, then applies any explicit CLI overrides on top.
 
 ### Demo Database
 
@@ -189,10 +196,9 @@ sqlite3 sample/readgrid_demo.db < sample/readgrid_demo.sql
 
 - Connections: `Enter` connect, `Esc` or `q` quit
 - Table browser: `/` filter, `r` reload, `Enter` open detail
-- Detail view: `e` export, `f` add filter, `[` `]` move sort column, `s` toggle sort order, `n` `p` change page, `Enter` open relations, `g` relationship graph, `Esc` back
-- In the export popup, `Tab` switches scope (`visible page` or `all matching rows`), and `f` switches format (`CSV` or `JSON`) before you start editing the suggested path.
-- JSON export writes an array of objects keyed by column name, and database `NULL` values are emitted as JSON `null`, not the rendered `"NULL"` string.
-- The suggested path still defaults under `db_csv/`, with filenames varying by scope and format: `tasks.csv`, `tasks_all.csv`, `tasks.json`, and `tasks_all.json`.
+- Detail view: `b` workspace menu, `e` export CSV, `f` add filter, `[` `]` move sort column, `s` toggle sort order, `n` `p` change page, `Enter` open relations, `g` relationship graph, `Esc` back
+- Workspace menu: save/open bookmarks and save/apply table-scoped filter presets
+- CSV export saves only the currently visible preview page in v1, and the default path is suggested under `db_csv/`.
 
 ### Development
 
